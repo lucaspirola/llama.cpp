@@ -505,6 +505,22 @@ void GgmlOvDecoder::compute_model_outputs() {
         if (cur_node->op == GGML_OP_NONE) {
             continue;
         }
+
+        // PERMUTE and TRANSPOSE are zero-copy views: they reuse the source buffer
+        // with different strides and never allocate new memory.  They must NEVER be
+        // materialised as OV Result nodes because:
+        //   (a) In the KV-cache subgraph, the source buffer is already registered as
+        //       output via SET_ROWS.  If OV also writes a transposed layout to the
+        //       same buffer it overwrites the correct KV data.
+        //   (b) In the kqv subgraph, OV would write physically transposed bytes to
+        //       kqv-0->data.  CPU then reads via non-contiguous PERMUTE strides,
+        //       producing a double-permutation → wrong values.
+        // The source tensor (e.g. MUL_MAT kqv-0) is the correct OV output; CPU
+        // reads it correctly through the view's non-contiguous strides.
+        if (cur_node->op == GGML_OP_PERMUTE || cur_node->op == GGML_OP_TRANSPOSE) {
+            continue;
+        }
+
         auto cur_node_use_count = m_cgraph->use_counts[ggml_hash_find(&m_cgraph->visited_hash_set, cur_node)];
         if (cur_node_use_count == 0) {
             // The output of SET_ROWS is the view_src tensor, which is updated in place. We should use the view_src name as the output name to make sure it can be correctly matched with the later ops that use the view_src.
@@ -522,13 +538,62 @@ void GgmlOvDecoder::compute_model_outputs() {
                 }
             }
             if (input_use_count == cur_node_use_count) {
-                cur_node = nullptr;
+                // All consumers are within the subgraph.
+                // EXCEPTION: if every consumer is a zero-copy view op (PERMUTE,
+                // TRANSPOSE, or VIEW), the CPU still needs to read cur_node's data via
+                // those view strides.  Register cur_node as an OV output so the bytes
+                // are written to memory before CPU accesses them.
+                bool all_consumers_are_views = true;
+                for (int i = 0; i < m_cgraph->n_nodes; i++) {
+                    ggml_tensor * node = m_cgraph->nodes[i];
+                    bool uses_cur = false;
+                    for (int j = 0; j < GGML_MAX_SRC; j++) {
+                        if (node->src[j] == cur_node) { uses_cur = true; break; }
+                    }
+                    if (uses_cur &&
+                        node->op != GGML_OP_PERMUTE &&
+                        node->op != GGML_OP_TRANSPOSE &&
+                        node->op != GGML_OP_VIEW) {
+                        all_consumers_are_views = false;
+                        break;
+                    }
+                }
+                if (!all_consumers_are_views) {
+                    cur_node = nullptr;
+                }
+            }
+        }
+        // Skip VIEW nodes whose view_src root is already registered as an output.
+        // OV materialising a VIEW as Result runs a Reshape op and writes the
+        // rearranged bytes back to the same underlying buffer, overwriting the
+        // correctly-written source data with a differently-shaped layout.
+        // CPU then reads via the source's strides and sees the wrong layout.
+        // Example: cache_v (view) → Reshape(ScatterUpdate) overwrites the V-cache.
+        // VIEW with use_count=0 (leaf, source is external) is exempted: its source
+        // is a Parameter, not in m_model_outputs, so the check finds no match.
+        if (cur_node != nullptr && cur_node->op == GGML_OP_VIEW &&
+            cur_node->view_src != nullptr) {
+            const ggml_tensor * vsrc = cur_node->view_src;
+            while (vsrc->view_src) vsrc = vsrc->view_src;
+            for (const auto & kv : m_model_outputs) {
+                const ggml_tensor * outr = kv.second;
+                while (outr->view_src) outr = outr->view_src;
+                if (outr == vsrc) {
+                    cur_node = nullptr;
+                    break;
+                }
             }
         }
         if (cur_node != nullptr) {
             std::string node_output_name(cur_node->name);
             m_model_outputs[node_output_name] = cur_node;
-            m_model_output_names.push_back(node_output_name);
+            // Avoid duplicate output names: multiple GGML nodes can share the same
+            // name (e.g., several VIEW tensors all named "node_53 (view)"). Duplicate
+            // v0::Result friendly names cause the GPU plugin to reject the topology
+            // with "Different primitive with id '...' exists already".
+            if (std::find(m_model_output_names.begin(), m_model_output_names.end(), node_output_name) == m_model_output_names.end()) {
+                m_model_output_names.push_back(node_output_name);
+            }
         }
     }
 }
