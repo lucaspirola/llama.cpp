@@ -846,7 +846,7 @@ static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
         x = 448.0f;
     }
     uint32_t bits;
-    memcpy(&bits, &x, 4);
+    memcpy(&bits, &x, sizeof(float));
     const int fp32_exp  = ((bits >> 23) & 0xFF) - 127;
     const int fp32_man  = (bits >> 20) & 0x7;
     int ue4m3_exp = fp32_exp + 7;
