@@ -186,6 +186,78 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
     y->d = sumq2 > 0 ? sumqx/sumq2 : d;
 }
 
+// Pick the 4-bit E2M1 code (index into kvalues_mxfp4) closest to x for a sub-block
+// scaled by e. Bit-identical to the CPU best_index_mxfp4() used by quantize_row_nvfp4_ref().
+static __device__ __forceinline__ uint8_t best_index_mxfp4(float x, float e) {
+    uint8_t best_index = 0;
+    float   best_err   = fabsf(kvalues_mxfp4[0]*e - x);
+    for (int i = 1; i < 16; ++i) {
+        const float err = fabsf(kvalues_mxfp4[i]*e - x);
+        if (err < best_err) {
+            best_err   = err;
+            best_index = i;
+        }
+    }
+    return best_index;
+}
+
+static __device__ void quantize_f32_nvfp4_block(const float * __restrict__ x, block_nvfp4 * __restrict__ y) {
+    constexpr int n_sub = QK_NVFP4 / QK_NVFP4_SUB; // 4 sub-blocks of 16 values
+
+    for (int s = 0; s < n_sub; ++s) {
+        const float * xb = x + s*QK_NVFP4_SUB;
+
+        float amax = 0.0f;
+        for (int j = 0; j < QK_NVFP4_SUB; ++j) {
+            amax = fmaxf(amax, fabsf(xb[j]));
+        }
+
+        if (amax == 0.0f) {
+            y->d[s] = 0;
+            for (int j = 0; j < QK_NVFP4_SUB/2; ++j) {
+                y->qs[s*(QK_NVFP4_SUB/2) + j] = 0;
+            }
+            continue;
+        }
+
+        // amax/6 maps the largest E2M1 magnitude (6.0) to amax. The UE4M3 sub-block scale
+        // is only 8-bit, so search a small window of UE4M3 codes around that starting
+        // point and keep the one with the lowest reconstruction error.
+        const uint8_t ue0 = ggml_cuda_fp32_to_ue4m3(amax / 6.0f);
+        uint8_t best_ue  = ue0;
+        float   best_err = INFINITY;
+        for (int c = -2; c <= 2; ++c) {
+            const int uec = (int) ue0 + c;
+            if (uec < 1 || uec > 0x7E) {
+                continue;
+            }
+            const float dc = ggml_cuda_ue4m3_to_fp32((uint8_t) uec);
+            if (dc == 0.0f) {
+                continue;
+            }
+            float err = 0.0f;
+            for (int j = 0; j < QK_NVFP4_SUB; ++j) {
+                const float r = kvalues_mxfp4[best_index_mxfp4(xb[j], dc)]*dc - xb[j];
+                err += r*r;
+            }
+            if (err < best_err) {
+                best_err = err;
+                best_ue  = (uint8_t) uec;
+            }
+        }
+
+        y->d[s] = best_ue;
+        const float d = ggml_cuda_ue4m3_to_fp32(best_ue);
+
+        for (int j = 0; j < QK_NVFP4_SUB/2; ++j) {
+            const uint8_t x0 = best_index_mxfp4(xb[0              + j], d);
+            const uint8_t x1 = best_index_mxfp4(xb[QK_NVFP4_SUB/2 + j], d);
+
+            y->qs[s*(QK_NVFP4_SUB/2) + j] = x0 | (x1 << 4);
+        }
+    }
+}
+
 // Wrapper functions for cpy.cu compatibility
 static __device__ void cpy_blck_f32_q4_0(const char * cxi, char * cdsti) {
     quantize_f32_q4_0_block((const float *)cxi, (block_q4_0 *)cdsti);
@@ -209,6 +281,10 @@ static __device__ void cpy_blck_f32_q8_0(const char * cxi, char * cdsti) {
 
 static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
     quantize_f32_iq4_nl_block((const float *)cxi, (block_iq4_nl *)cdsti);
+}
+
+static __device__ void cpy_blck_f32_nvfp4(const char * cxi, char * cdsti) {
+    quantize_f32_nvfp4_block((const float *)cxi, (block_nvfp4 *)cdsti);
 }
 
 template<typename src_t, typename dst_t>
