@@ -659,6 +659,44 @@ static __device__ __forceinline__ void dequantize_V_nvfp4(const void * __restric
     }
 }
 
+// Dequantize one 16-byte tile chunk: 8 consecutive NVFP4 elements (el0 .. el0+7)
+// of a K/V row into 4 half2. row_base points at the first block_nvfp4 of the row;
+// el0 is the element index within the row and must be a multiple of 8.
+//
+// Because QK_NVFP4_SUB == 16 and el0 is a multiple of 8, all 8 elements share the
+// same block, the same 16-element sub-block scale and the same nibble shift, and the
+// 8 packed bytes are exactly the two 4-byte groups qs[2*s] and qs[2*s+1]. The 8
+// 4-bit codes are decoded with two get_int_from_table_16 calls (prmt-based 16-entry
+// table lookup, as in vec_dot_fattn_vec_KQ_nvfp4) instead of 8 scalar LUT loads,
+// and the UE4M3 scale is converted only once.
+static __device__ __forceinline__ void dequantize_nvfp4_chunk(
+        const block_nvfp4 * __restrict__ row_base, const int el0, half2 * __restrict__ dst) {
+    const int ib    = el0 /  QK_NVFP4;                      // nvfp4 block within the row
+    const int il    = el0 %  QK_NVFP4;                      // element within block (0..63)
+    const int s     = il /  QK_NVFP4_SUB;                   // 16-element sub-block (0..3)
+    const int shift = (il % QK_NVFP4_SUB) / (QK_NVFP4_SUB/2); // 0 -> low nibble, 1 -> high nibble
+
+    const block_nvfp4 & xb = row_base[ib];
+
+    // Two 4-byte groups of the sub-block: get_int_from_table_16 decodes each into an
+    // int2 whose .x holds the 4 low-nibble values and .y the 4 high-nibble values,
+    // each as 4 packed int8. shift selects which nibble half this chunk needs.
+    const int2 g0 = get_int_from_table_16(get_int_b1(xb.qs, 2*s + 0), kvalues_mxfp4);
+    const int2 g1 = get_int_from_table_16(get_int_b1(xb.qs, 2*s + 1), kvalues_mxfp4);
+    const int   v0 = shift ? g0.y : g0.x; // codes for elements el0+0 .. el0+3
+    const int   v1 = shift ? g1.y : g1.x; // codes for elements el0+4 .. el0+7
+
+    // kvalues_mxfp4 stores 2*E2M1; ggml_cuda_ue4m3_to_fp32 already folds in the 0.5 factor.
+    const half2 d = __half2half2((half) ggml_cuda_ue4m3_to_fp32(xb.d[s]));
+
+    const int8_t * c0 = (const int8_t *) &v0;
+    const int8_t * c1 = (const int8_t *) &v1;
+    dst[0] = d * make_half2(c0[0], c0[1]);
+    dst[1] = d * make_half2(c0[2], c0[3]);
+    dst[2] = d * make_half2(c1[0], c1[1]);
+    dst[3] = d * make_half2(c1[2], c1[3]);
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {

@@ -6,32 +6,32 @@
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
 
-template <int DKQ, int DV, int ncols2>
+template <int DKQ, int DV, int ncols2, typename KV_src_t = half2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * Q = dst->src[0];
 
     if constexpr (ncols2 <= 8) {
         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
-            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2, KV_src_t>(ctx, dst);
             return;
         }
     }
 
     if constexpr (ncols2 <= 16) {
         if (Q->ne[1] <= 16/ncols2) {
-            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2, KV_src_t>(ctx, dst);
             return;
         }
     }
 
     if (Q->ne[1] <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
             (GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256)) {
-        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2, KV_src_t>(ctx, dst);
         return;
     }
 
-    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
+    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2, KV_src_t>(ctx, dst);
 }
 
 template <int DKQ, int DV>
@@ -111,6 +111,41 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     }
 }
 
+// NVFP4 KV-cache: fused inline-dequant variant of the f16 MMA kernel. NVFP4 K/V
+// are head-dim 128 only; the kernel dequantizes the NVFP4 blocks into the shared
+// half2 tile during the load, so no separate f16 K/V scratch buffer is allocated.
+// The ncols1/ncols2 selection mirrors the non-Volta path of switch_ncols2<128,128>.
+static void ggml_cuda_flash_attn_ext_mma_f16_nvfp4(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * KQV  = dst;
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * mask = dst->src[3];
+
+    GGML_ASSERT(Q->ne[0] == 128 && dst->src[2]->ne[0] == 128);
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+
+    const bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+    if (use_gqa_opt && gqa_ratio > 4) {
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<128, 128, 8, block_nvfp4>(ctx, dst);
+        return;
+    }
+    if (use_gqa_opt && gqa_ratio > 2) {
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<128, 128, 4, block_nvfp4>(ctx, dst);
+        return;
+    }
+    if (use_gqa_opt && gqa_ratio > 1) {
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<128, 128, 2, block_nvfp4>(ctx, dst);
+        return;
+    }
+    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<128, 128, 1, block_nvfp4>(ctx, dst);
+}
+
 static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * KQV  = dst;
@@ -118,6 +153,15 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+
+    // NVFP4 KV-cache with head-dim 128 routes to the fused inline-dequant variant
+    // of this kernel. Other head dims fall through to the standard f16-conversion
+    // MMA path (launch_fattn converts NVFP4 K/V to f16 scratch buffers).
+    if (K->type == GGML_TYPE_NVFP4 && V->type == GGML_TYPE_NVFP4
+            && Q->ne[0] == 128 && V->ne[0] == 128) {
+        ggml_cuda_flash_attn_ext_mma_f16_nvfp4(ctx, dst);
+        return;
+    }
 
     switch (Q->ne[0]) {
         case 64:
@@ -493,6 +537,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 return BEST_FATTN_KERNEL_VEC;
             }
         }
+        // NVFP4 KV-cache prefill (head-dim 128) is handled by the fused inline-dequant
+        // variant of the f16 MMA kernel; see ggml_cuda_flash_attn_ext_mma_f16.
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
