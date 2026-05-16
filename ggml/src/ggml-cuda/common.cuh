@@ -831,14 +831,48 @@ static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
 }
 
 static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
-#if defined(BLACKWELL_MMA_AVAILABLE) // This is used for NVFP4 subblock scale quantizations only
+#if defined(BLACKWELL_MMA_AVAILABLE)
     if (!(x > 0.0f)) {
         return 0;
     }
     const __nv_fp8_e4m3 xf(x);
     return xf.__x;
 #else
-     NO_DEVICE_CODE; // Used only for NVFP4 Scales for Activations, only for Blackwell
+    // Portable software fallback, bit-identical to the CPU ggml_fp32_to_ue4m3().
+    if (!(x > 0.0f)) {
+        return 0;
+    }
+    if (x > 448.0f) {
+        x = 448.0f;
+    }
+    uint32_t bits;
+    memcpy(&bits, &x, 4);
+    const int fp32_exp  = ((bits >> 23) & 0xFF) - 127;
+    const int fp32_man  = (bits >> 20) & 0x7;
+    int ue4m3_exp = fp32_exp + 7;
+    if (ue4m3_exp <= 0) {
+        int man = (int) (x * 512.0f + 0.5f);
+        if (man > 7) {
+            man = 7;
+        }
+        if (man < 1) {
+            return 0;
+        }
+        return (uint8_t) man;
+    }
+    if (ue4m3_exp >= 15) {
+        return 0x7E;
+    }
+    const int round_bit = (bits >> 19) & 1;
+    int ue4m3_man = fp32_man + round_bit;
+    if (ue4m3_man > 7) {
+        ue4m3_man = 0;
+        ue4m3_exp++;
+        if (ue4m3_exp >= 15) {
+            return 0x7E;
+        }
+    }
+    return (uint8_t) ((ue4m3_exp << 3) | ue4m3_man);
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 }
 
