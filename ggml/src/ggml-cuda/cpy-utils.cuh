@@ -187,7 +187,9 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
 }
 
 // Pick the 4-bit E2M1 code (index into kvalues_mxfp4) closest to x for a sub-block
-// scaled by e. Bit-identical to the CPU best_index_mxfp4() used by quantize_row_nvfp4_ref().
+// scaled by e. Mirrors the CPU best_index_mxfp4() used by quantize_row_nvfp4_ref():
+// same linear scan, same strict-less-than tie-break (so ties pick the lower code).
+// The return type is uint8_t here vs int on the CPU, but the result is always 0..15.
 static __device__ __forceinline__ uint8_t best_index_mxfp4(float x, float e) {
     uint8_t best_index = 0;
     float   best_err   = fabsf(kvalues_mxfp4[0]*e - x);
@@ -207,9 +209,14 @@ static __device__ void quantize_f32_nvfp4_block(const float * __restrict__ x, bl
     for (int s = 0; s < n_sub; ++s) {
         const float * xb = x + s*QK_NVFP4_SUB;
 
+        // Use the same scalar comparison as the CPU reference rather than fmaxf(): under
+        // CUDA's default flush-to-zero mode fmaxf() would flush a denormal amax to 0,
+        // diverging from the CPU and silently zeroing a (tiny but non-zero) sub-block.
         float amax = 0.0f;
         for (int j = 0; j < QK_NVFP4_SUB; ++j) {
-            amax = fmaxf(amax, fabsf(xb[j]));
+            if (amax < fabsf(xb[j])) {
+                amax = fabsf(xb[j]);
+            }
         }
 
         if (amax == 0.0f) {
@@ -225,7 +232,8 @@ static __device__ void quantize_f32_nvfp4_block(const float * __restrict__ x, bl
         // scale has only a 3-bit mantissa, so the code nearest to amax/6 is rarely the
         // one that minimises reconstruction error. Search a small window of UE4M3 scale
         // codes around it and keep the lowest-error one. Every code in [1, 0x7E] decodes
-        // to a finite non-zero scale, so no zero-scale guard is needed inside the loop.
+        // to a finite non-zero scale (only code 0 and the NaN sentinel 0x7F decode to 0),
+        // so no zero-scale guard is needed inside the loop.
         const uint8_t ue0 = ggml_cuda_fp32_to_ue4m3(amax / 6.0f);
         uint8_t best_ue  = ue0;
         float   best_err = INFINITY;

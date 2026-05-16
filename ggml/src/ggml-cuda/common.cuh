@@ -830,15 +830,13 @@ static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
 #endif // defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
 }
 
+// Encode an FP32 value as a UE4M3 (unsigned FP8 E4M3) code. This is a verbatim port of
+// the CPU ggml_fp32_to_ue4m3() and produces bit-identical results on every architecture
+// (round-half-up, saturating at 448.0). It is deliberately NOT routed through the
+// hardware __nv_fp8_e4m3 conversion: that uses round-to-nearest-even and would diverge
+// from the CPU reference at exact-halfway inputs, breaking the bit-exact CPU/GPU parity
+// the NVFP4 quantizer relies on.
 static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
-#if defined(BLACKWELL_MMA_AVAILABLE)
-    if (!(x > 0.0f)) {
-        return 0;
-    }
-    const __nv_fp8_e4m3 xf(x);
-    return xf.__x;
-#else
-    // Portable software fallback, bit-identical to the CPU ggml_fp32_to_ue4m3().
     if (!(x > 0.0f)) {
         return 0;
     }
@@ -873,7 +871,6 @@ static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
         }
     }
     return (uint8_t) ((ue4m3_exp << 3) | ue4m3_man);
-#endif // defined(BLACKWELL_MMA_AVAILABLE)
 }
 
 __device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e) {
