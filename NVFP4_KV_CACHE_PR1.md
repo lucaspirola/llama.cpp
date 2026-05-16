@@ -84,6 +84,15 @@ No code change needed. CPU computes NVFP4 KV via the existing `dequantize_row_nv
 fallback. Vulkan / SYCL / Metal already cleanly reject NVFP4 KV via their flash-attention
 type whitelists (verified) — no crash.
 
+### Ecosystem availability (audited)
+A tree-wide sweep confirmed only two places carry KV-cache-type-specific knowledge:
+`common/arg.cpp` (`kv_cache_types`, the shared `--cache-type-k/v` parser) and
+`tools/llama-bench` (its own `ggml_type_from_name`, since it has custom CLI args) — both
+now accept `nvfp4`. Every other inference tool (`llama-cli`, `llama-server`,
+`llama-perplexity`, `batched-bench`, `mtmd`, `tts`, …) takes `--cache-type-k/v` via the
+common parser and passes the `ggml_type` straight through; `libllama` (`src/`) is fully
+type-agnostic (no KV-type whitelist). So NVFP4 KV is usable across the whole ecosystem.
+
 ## 4. Verification (RTX 5080, CUDA 13.2)
 
 ### Correctness
