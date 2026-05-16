@@ -378,7 +378,7 @@ void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RE
             const uint8_t ue0 = ggml_fp32_to_ue4m3(amax / 6.0f);
             uint8_t best_ue  = ue0;
             float   best_err = INFINITY;
-            for (int c = -2; c <= 2; c++) {
+            for (int c = -2; c <= 2; ++c) {
                 const int uec = (int) ue0 + c;
                 if (uec < 1 || uec > 0x7E) {
                     continue;

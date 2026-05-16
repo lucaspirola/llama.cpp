@@ -8949,9 +8949,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
 
-    // NVFP4 KV cache: a direct head-size-128 case (the type_KV loop above only reaches
-    // hsk 64/72 for quantized types) plus mixed NVFP4/F16 pairs (exercised when the
-    // backend builds the full quant matrix, e.g. GGML_CUDA_FA_ALL_QUANTS).
+    // NVFP4 KV cache extra coverage. The type_KV loop above runs NVFP4 at hsk 64 and 72;
+    // since QK_NVFP4 == 64 the hsk=72 cases pad up to D=128, so D=128 is already exercised
+    // there, but an explicit hsk=128 nvfp4-nvfp4 case is kept for clarity. The mixed
+    // NVFP4/F16 K/V pairs only dispatch a kernel on builds with the full quant matrix
+    // (-DGGML_CUDA_FA_ALL_QUANTS); on a standard build they report "not supported",
+    // exactly like the q8_0/q4_0 mixed-type cases above.
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4));
     test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_NVFP4));
