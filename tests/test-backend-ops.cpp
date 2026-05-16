@@ -8958,6 +8958,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_NVFP4));
 
+    // NVFP4 KV cache prefill coverage (hsk=hsv=128, Q columns > 2): exercises the
+    // native FP4 flash-attention kernel, which only dispatches for Q->ne[1] > 2.
+    // Sweep the ncols1 selection {3->4, 4->4, 8->8} and include a long-KV case so
+    // parallel_blocks > 1 and the KV-split combine path is verified.
+    for (int nb : {3, 4, 8}) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 4096,   4, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 4096,   8, true, true,  0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  256,   4, true, false, 8.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  256,   4, true, false, 0.0f, 8.0f, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4));
+    // Non-contiguous (permuted) NVFP4 K/V prefill: exercises the row-stride-driven
+    // loader of the fused inline-dequant MMA kernel with genuine NVFP4 row strides.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  256,   4, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4, {0, 2, 1, 3}));
+
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
