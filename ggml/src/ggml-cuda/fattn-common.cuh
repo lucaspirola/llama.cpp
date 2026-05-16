@@ -307,8 +307,9 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_nvfp4(
         const int s  = m / (QK_NVFP4_SUB/4);            // 16-element sub-block (0..3)
         const int r  = m % (QK_NVFP4_SUB/4);            // element-int within sub-block (0..3)
 
-        // qs[] is packed 2 values/byte: low nibbles hold the first 8 sub-block values,
-        // high nibbles the last 8. r selects the 4-byte group and the nibble half.
+        // A sub-block's 16 values are packed 2/byte across 8 bytes (= two 4-byte groups):
+        // low nibbles hold values 0..7, high nibbles hold values 8..15. Of the 2-bit r,
+        // bit 0 selects the 4-byte group and bit 1 selects the low/high nibble half.
         const int  aux_q4 = get_int_b1(K_nvfp4[ib].qs, 2*s + (r & 1));
         const int2 v_full = get_int_from_table_16(aux_q4, kvalues_mxfp4);
         const int  v      = (r & 2) ? v_full.y : v_full.x;
@@ -317,7 +318,9 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_nvfp4(
 
         const int sumi = ggml_cuda_dp4a(v, u, 0);
 
-        // kvalues_mxfp4 stores 2*E2M1; ggml_cuda_ue4m3_to_fp32 already folds in the 0.5 factor.
+        // Reconstructed K = K_d * fp4_value. kvalues_mxfp4 holds 2*E2M1 and
+        // ggml_cuda_ue4m3_to_fp32 already folds in the compensating 0.5, so the product
+        // K_d * kvalues_mxfp4[code] is exactly the dequantized value (see dequantize_V_nvfp4).
         const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
         const float  K_d  = ggml_cuda_ue4m3_to_fp32(K_nvfp4[ib].d[s]);
         sum += K_d * Q_ds.x * sumi;

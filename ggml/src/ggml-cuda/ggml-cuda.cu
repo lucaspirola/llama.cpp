@@ -5247,6 +5247,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_IQ4_NL) {
                     return true;
                 }
+                // NVFP4 is supported as a copy destination only (quantize-on-write to
+                // the KV cache); the reverse NVFP4->F32 copy is intentionally omitted,
+                // as for IQ4_NL -- flash attention reads the KV cache directly.
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_NVFP4) {
                     return true;
                 }

@@ -220,9 +220,12 @@ static __device__ void quantize_f32_nvfp4_block(const float * __restrict__ x, bl
             continue;
         }
 
-        // amax/6 maps the largest E2M1 magnitude (6.0) to amax. The UE4M3 sub-block scale
-        // is only 8-bit, so search a small window of UE4M3 codes around that starting
-        // point and keep the one with the lowest reconstruction error.
+        // Mirror of quantize_row_nvfp4_ref() in ggml-quants.c -- must stay bit-identical.
+        // amax/6 maps the largest E2M1 magnitude (6.0) to amax, but the UE4M3 sub-block
+        // scale has only a 3-bit mantissa, so the code nearest to amax/6 is rarely the
+        // one that minimises reconstruction error. Search a small window of UE4M3 scale
+        // codes around it and keep the lowest-error one. Every code in [1, 0x7E] decodes
+        // to a finite non-zero scale, so no zero-scale guard is needed inside the loop.
         const uint8_t ue0 = ggml_cuda_fp32_to_ue4m3(amax / 6.0f);
         uint8_t best_ue  = ue0;
         float   best_err = INFINITY;
@@ -232,9 +235,6 @@ static __device__ void quantize_f32_nvfp4_block(const float * __restrict__ x, bl
                 continue;
             }
             const float dc = ggml_cuda_ue4m3_to_fp32((uint8_t) uec);
-            if (dc == 0.0f) {
-                continue;
-            }
             float err = 0.0f;
             for (int j = 0; j < QK_NVFP4_SUB; ++j) {
                 const float r = kvalues_mxfp4[best_index_mxfp4(xb[j], dc)]*dc - xb[j];
