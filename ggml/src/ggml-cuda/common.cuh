@@ -261,6 +261,12 @@ static const char * cu_get_error_str(CUresult err) {
 #    define BLACKWELL_MMA_AVAILABLE
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL
 
+// FP8 (E4M3) tensor-core MMA (mma.sync.aligned.m16n8k32 ... .e4m3 ...) is available on
+// Ada Lovelace (sm_89) and newer NVIDIA GPUs.
+#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE
+#define FP8_MMA_AVAILABLE
+#endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE
+
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 #define CP_ASYNC_AVAILABLE
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
@@ -873,6 +879,64 @@ static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
     return (uint8_t) ((ue4m3_exp << 3) | ue4m3_man);
 }
 
+// Decode a signed OCP FP8 E4M3 code to fp32. Pure software, bit-identical to the
+// CPU reference ggml_se4m3_to_fp32() in ggml-impl.h - decoding is exact (no
+// rounding) so CPU and GPU agree for every code; 0x7F / 0xFF (NaN) decode to 0.
+static __device__ __forceinline__ float ggml_cuda_se4m3_to_fp32(uint8_t x) {
+    if ((x & 0x7F) == 0x7F) {
+        return 0.0f;
+    }
+    const float sign = (x & 0x80) ? -1.0f : 1.0f;
+    const int   exp  = (x >> 3) & 0xF;
+    const int   man  = x & 0x7;
+    float mag;
+    if (exp == 0) {
+        mag = ldexpf((float) man, -9); // subnormal: man * 2^-9
+    } else {
+        mag = ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+    }
+    return sign * mag;
+}
+
+// Encode an fp32 value as a signed OCP FP8 E4M3 code. Software, bit-identical to the CPU
+// reference ggml_fp32_to_se4m3() in ggml-impl.h (round-half-up, saturating at +-448) so
+// quantized data is the same on CPU and GPU.
+static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_se4m3(float x) {
+    const uint8_t sign = (x < 0.0f) ? 0x80 : 0x00;
+    const float   ax   = fabsf(x);
+    if (!(ax <= 448.0f)) {
+        return ax != ax ? (uint8_t) 0x7F : (uint8_t) (sign | 0x7E);
+    }
+    if (ax == 0.0f) {
+        return sign;
+    }
+    uint32_t bits;
+    memcpy(&bits, &ax, sizeof(bits));
+    const int fp32_exp = ((bits >> 23) & 0xFF) - 127;
+    const int fp32_man = (bits >> 20) & 0x7;
+    int e4m3_exp = fp32_exp + 7;
+    if (e4m3_exp <= 0) {
+        const int man = (int) (ax * 512.0f + 0.5f);
+        if (man >= 8) {
+            return (uint8_t) (sign | 0x08); // rounds up to the smallest normal (2^-6)
+        }
+        if (man < 1) {
+            return sign;
+        }
+        return (uint8_t) (sign | man);
+    }
+    const int round_bit = (bits >> 19) & 1;
+    int e4m3_man = fp32_man + round_bit;
+    if (e4m3_man > 7) {
+        e4m3_man = 0;
+        e4m3_exp++;
+    }
+    if (e4m3_exp > 15 || (e4m3_exp == 15 && e4m3_man > 6)) {
+        return (uint8_t) (sign | 0x7E); // saturate to the largest finite magnitude
+    }
+    return (uint8_t) (sign | (e4m3_exp << 3) | e4m3_man);
+}
+
 __device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e) {
     const uint8_t sign_bit = (x < 0.0f) << 3;
     float         ax       = fabsf(x) * e;
@@ -1017,6 +1081,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_NVFP4> {
     static constexpr int qk = QK_NVFP4;
     static constexpr int qr = QR_NVFP4;
     static constexpr int qi = QI_NVFP4;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_F8_E4M3> {
+    static constexpr int qk = QK_F8_E4M3;
+    static constexpr int qr = QR_F8_E4M3;
+    static constexpr int qi = QI_F8_E4M3;
 };
 
 template<>

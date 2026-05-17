@@ -295,6 +295,31 @@ static __device__ void cpy_blck_f32_nvfp4(const char * cxi, char * cdsti) {
     quantize_f32_nvfp4_block((const float *)cxi, (block_nvfp4 *)cdsti);
 }
 
+static __device__ void quantize_f32_f8_e4m3_block(const float * __restrict__ x, block_f8_e4m3 * __restrict__ y) {
+    // Scalar comparison rather than fmaxf(): under CUDA's flush-to-zero mode fmaxf() would
+    // flush a denormal amax to 0, diverging from the CPU reference quantize_row_f8_e4m3_ref().
+    float amax = 0.0f;
+    for (int j = 0; j < QK_F8_E4M3; ++j) {
+        const float ax = fabsf(x[j]);
+        if (amax < ax) {
+            amax = ax;
+        }
+    }
+
+    const float d  = amax / 448.0f;
+    const float id = d != 0.0f ? 1.0f/d : 0.0f;
+
+    y->d = d;
+
+    for (int j = 0; j < QK_F8_E4M3; ++j) {
+        y->qs[j] = ggml_cuda_fp32_to_se4m3(x[j]*id);
+    }
+}
+
+static __device__ void cpy_blck_f32_f8_e4m3(const char * cxi, char * cdsti) {
+    quantize_f32_f8_e4m3_block((const float *)cxi, (block_f8_e4m3 *)cdsti);
+}
+
 template<typename src_t, typename dst_t>
 static __device__ void cpy_1_scalar(const char * cxi, char * cdsti) {
     *(dst_t *) cdsti = ggml_cuda_cast<dst_t>(*(const src_t *) cxi);

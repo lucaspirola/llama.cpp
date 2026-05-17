@@ -1193,6 +1193,43 @@ namespace ggml_cuda_mma {
 #endif // AMPERE_MMA_AVAILABLE
     }
 
+    // FP8 E4M3 x E4M3 -> F32, m16n8k32 (Ada / sm_89 and newer). The A/B tiles hold packed
+    // E4M3 bytes: tile<16,8,uint32_t> is 4 uint32/thread = 16 E4M3 values, tile<8,8,uint32_t>
+    // is 2 uint32/thread = 8 E4M3 values. k=32 gives 2x the MACs/instruction of f16 m16n8k16.
+    static __device__ __forceinline__ void mma(
+            tile<16, 8, float> & D, const tile<16, 8, uint32_t> & A, const tile<8, 8, uint32_t> & B) {
+#ifdef FP8_MMA_AVAILABLE
+        const int * Axi = (const int *) A.x;
+        const int * Bxi = (const int *) B.x;
+        int       * Dxi = (int       *) D.x;
+        asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+            : "+r"(Dxi[0]), "+r"(Dxi[1]), "+r"(Dxi[2]), "+r"(Dxi[3])
+            : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[1]));
+#else
+        GGML_UNUSED_VARS(D, A, B);
+        NO_DEVICE_CODE;
+#endif // FP8_MMA_AVAILABLE
+    }
+
+    template <data_layout dl_d>
+    static __device__ __forceinline__ void mma(
+            tile<16, 16, float, dl_d> & D, const tile<16, 8, uint32_t> & A, const tile<16, 8, uint32_t> & B) {
+#ifdef FP8_MMA_AVAILABLE
+        const int * Axi = (const int *) A.x;
+        const int * Bxi = (const int *) B.x;
+        int       * Dxi = (int       *) D.x;
+        asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+            : "+r"(Dxi[0]), "+r"(Dxi[1]), "+r"(Dxi[2]), "+r"(Dxi[3])
+            : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[2]));
+        asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+            : "+r"(Dxi[4]), "+r"(Dxi[5]), "+r"(Dxi[6]), "+r"(Dxi[7])
+            : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[1]), "r"(Bxi[3]));
+#else
+        GGML_UNUSED_VARS(D, A, B);
+        NO_DEVICE_CODE;
+#endif // FP8_MMA_AVAILABLE
+    }
+
     template <data_layout dl_ab, data_layout dl_d>
     static __device__ __forceinline__ void mma(
             tile<16, 16, float, dl_d> & D, const tile<16, 8, half2, dl_ab> & A, const tile<16, 8, half2, dl_ab> & B) {

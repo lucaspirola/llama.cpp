@@ -401,6 +401,73 @@ class Q8_0(__Quant, qtype=GGMLQuantizationType.Q8_0):
         return (x * d)
 
 
+class F8E4M3(__Quant, qtype=GGMLQuantizationType.F8_E4M3):
+    @staticmethod
+    def se4m3_to_fp32(x: np.ndarray) -> np.ndarray:
+        """Decode signed OCP FP8 E4M3 (bias=7); matches ggml_se4m3_to_fp32 in ggml-impl.h."""
+        sign = np.where((x & 0x80) != 0, np.float32(-1.0), np.float32(1.0))
+        exp  = ((x >> 3) & 0xF).astype(np.int32)
+        man  = (x & 0x7).astype(np.float32)
+        mag  = np.where(
+            exp == 0,
+            man * np.float32(2.0 ** -9),
+            (1.0 + man / 8.0) * (2.0 ** (exp.astype(np.float32) - 7)))
+        return np.where((x & 0x7F) == 0x7F, np.float32(0.0), sign * mag).astype(np.float32)
+
+    @staticmethod
+    def fp32_to_se4m3(x: np.ndarray) -> np.ndarray:
+        """Encode float32 to signed OCP FP8 E4M3; matches ggml_fp32_to_se4m3 in ggml-impl.h."""
+        x    = x.astype(np.float32)
+        sign = np.where(x < 0.0, np.uint8(0x80), np.uint8(0x00))
+        ax   = np.abs(x).astype(np.float32)
+
+        bits     = ax.view(np.uint32)
+        fp32_exp = ((bits >> 23) & 0xFF).astype(np.int32) - 127
+        fp32_man = ((bits >> 20) & 0x7).astype(np.int32)
+        e4m3_exp = fp32_exp + 7
+
+        # subnormal: man = round(ax * 2^9), >=8 carries up to the smallest normal
+        sub_man    = (ax * 512.0 + 0.5).astype(np.int32)
+        sub_result = np.where(sub_man >= 8, np.uint8(0x08),
+                     np.where(sub_man <  1, np.uint8(0x00), sub_man.astype(np.uint8)))
+
+        # normal: round-half-up, carry into exponent, saturate at 0x7E
+        round_bit = ((bits >> 19) & 1).astype(np.int32)
+        man       = fp32_man + round_bit
+        overflow  = man > 7
+        man       = np.where(overflow, 0, man)
+        exp       = np.where(overflow, e4m3_exp + 1, e4m3_exp)
+        sat       = (exp > 15) | ((exp == 15) & (man > 6))
+        normal_result = np.where(sat, np.uint8(0x7E), ((exp << 3) | man).astype(np.uint8))
+
+        mag = np.where(ax == 0.0, np.uint8(0x00),
+              np.where(~(ax <= 448.0), np.uint8(0x7E),  # finite overflow (NaN fixed up below)
+              np.where(e4m3_exp <= 0, sub_result, normal_result)))
+        result = (sign | mag).astype(np.uint8)
+        return np.where(np.isnan(ax), np.uint8(0x7F), result).astype(np.uint8)
+
+    @classmethod
+    # Implementation of F8_E4M3 with bit-exact same results as reference implementation in ggml-quants.c
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        d = abs(blocks).max(axis=1, keepdims=True) / 448.0
+        with np.errstate(divide="ignore"):
+            id = np.where(d == 0, 0, 1 / d)
+        qs = cls.fp32_to_se4m3(blocks * id)
+
+        # (n_blocks, 2)
+        d = d.astype(np.float16).view(np.uint8)
+        # (n_blocks, block_size)
+        return np.concatenate([d, qs], axis=1)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        d, x = np.split(blocks, [2], axis=1)
+        d = d.view(np.float16).astype(np.float32)
+        x = cls.se4m3_to_fp32(x)
+
+        return (x * d)
+
+
 class Q2_K(__Quant, qtype=GGMLQuantizationType.Q2_K):
     @classmethod
     def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:

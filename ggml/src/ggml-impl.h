@@ -552,6 +552,66 @@ static inline uint8_t ggml_fp32_to_ue4m3(float x) {
     return (uint8_t) ((ue4m3_exp << 3) | ue4m3_man);
 }
 
+// SE4M3: signed OCP FP8 E4M3 - 1 sign bit, 4 exponent bits (bias 7), 3 mantissa bits.
+// Largest finite magnitude is +-448 (0x7E); there are no infinities and 0x7F / 0xFF
+// are NaN. This is the value codec for the f8_e4m3 data type (block_f8_e4m3).
+// The CUDA encoder ggml_cuda_fp32_to_se4m3() is kept bit-identical to this one
+// (round-half-up, saturating at 448) so quantized data matches on CPU and GPU.
+static inline float ggml_se4m3_to_fp32(uint8_t x) {
+    if ((x & 0x7F) == 0x7F) { // NaN -> 0.0f
+        return 0.0f;
+    }
+    const float sign = (x & 0x80) ? -1.0f : 1.0f;
+    const int   exp  = (x >> 3) & 0xF;
+    const int   man  = x & 0x7;
+    float mag;
+    if (exp == 0) {
+        mag = ldexpf((float) man, -9); // subnormal: man * 2^-9
+    } else {
+        mag = ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+    }
+    return sign * mag;
+}
+
+static inline uint8_t ggml_fp32_to_se4m3(float x) {
+    const uint8_t sign = (x < 0.0f) ? 0x80 : 0x00;
+    const float   ax   = fabsf(x);
+    if (!(ax <= 448.0f)) {
+        // NaN encodes as positive NaN (0x7F) - a NaN carries no meaningful sign;
+        // a finite value above the range saturates to the largest finite magnitude.
+        return ax != ax ? (uint8_t) 0x7F : (uint8_t) (sign | 0x7E);
+    }
+    if (ax == 0.0f) {
+        return sign;
+    }
+    uint32_t bits;
+    memcpy(&bits, &ax, 4);
+    const int fp32_exp = ((bits >> 23) & 0xFF) - 127;
+    const int fp32_man = (bits >> 20) & 0x7;
+    int e4m3_exp = fp32_exp + 7;
+    if (e4m3_exp <= 0) {
+        // subnormal: value = man * 2^-9, man = round(ax * 2^9)
+        const int man = (int) (ax * 512.0f + 0.5f);
+        if (man >= 8) {
+            return (uint8_t) (sign | 0x08); // rounds up to the smallest normal (2^-6)
+        }
+        if (man < 1) {
+            return sign;
+        }
+        return (uint8_t) (sign | man);
+    }
+    const int round_bit = (bits >> 19) & 1;
+    int e4m3_man = fp32_man + round_bit;
+    if (e4m3_man > 7) {
+        e4m3_man = 0;
+        e4m3_exp++;
+    }
+    if (e4m3_exp > 15 || (e4m3_exp == 15 && e4m3_man > 6)) {
+        return (uint8_t) (sign | 0x7E); // saturate to the largest finite magnitude
+    }
+    return (uint8_t) (sign | (e4m3_exp << 3) | e4m3_man);
+}
+
 /**
  * Converts brain16 to float32.
  *
