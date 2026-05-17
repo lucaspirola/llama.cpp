@@ -515,9 +515,11 @@ static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, c
 // Loads a tile of K/V data from global memory into the shared half2 tile.
 // KV_src_t selects the in-memory representation of K/V:
 //   - half2       (default): byte-identical to the original f16 loader.
-//   - block_nvfp4          : K/V are stored as NVFP4 blocks; each thread reads the
-//                            packed bytes and dequantizes them inline into the
-//                            shared half2 tile, so everything downstream is unchanged.
+//   - block_nvfp4          : K/V are stored as NVFP4 blocks. With kq_compute_f16, K and V
+//                            are dequantized inline to the shared half2 tile. With
+//                            kq_compute_fp8, K (is_V == false) is instead transcoded to
+//                            raw E4M3 + per-slice scales for the direct e4m3 MMA, exactly
+//                            like block_f8_e4m3 K; V stays an inline f16 dequant.
 //   - block_f8_e4m3        : K/V are stored as FP8 E4M3 blocks. V (is_V == true) is
 //                            dequantized inline to f16, exactly like NVFP4. K
 //                            (is_V == false) is packed raw: the e4m3 bytes are stored
@@ -539,7 +541,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
     const int chunks_per_row = D2 / h2_per_chunk;
 
     if constexpr (std::is_same_v<KV_src_t, block_nvfp4>) {
-        // NVFP4 path: synchronous, plain loads of the 36-byte blocks + inline dequant.
+        // NVFP4 path: synchronous, plain loads of the 36-byte blocks. K/V are dequantized
+        // to f16, except K under the FP8 compute path which is transcoded to raw e4m3.
         // block_nvfp4 is not a 16-byte multiple so cp.async is not used here.
         static_assert(!use_cp_async, "cp_async not supported for block_nvfp4 tiles");
         const half2 zero[4] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
@@ -565,18 +568,44 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                 for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
                     const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
 
-                    half2 * dst = tile_KV + i*stride_tile + k*h2_per_chunk;
-                    if (!oob_check || i < i_sup) {
-                        // One 16-byte chunk == h2_per_chunk (4) half2 == 8 NVFP4 elements.
-                        // el0 = k*8 is a multiple of 8, so the whole chunk is decoded in
-                        // one call (single scale conversion + vectorized table decode).
-                        static_assert(h2_per_chunk == 4, "nvfp4 chunk decode assumes 4 half2/chunk");
-                        const block_nvfp4 * row = KV + i*stride_KV;
-                        dequantize_nvfp4_chunk(row, k*h2_per_chunk*2, dst);
+                    if constexpr (!is_V && std::is_same_v<KQ_compute_t, kq_compute_fp8>) {
+                        // NVFP4 K + FP8 compute: transcode the chunk to raw e4m3 bytes
+                        // packed contiguously (element e of the row at byte e) and store
+                        // the 32-k slice's representative scale in the tile padding zone,
+                        // mirroring the block_f8_e4m3 K-mode so load_tile_e4m3_direct and
+                        // the per-block-scale compute branch consume it unchanged.
+                        // QK_F8_E4M3 (32) is the e4m3 m16n8k32 MMA k-slice width: one
+                        // representative scale per slice, the +4 tile padding holding all
+                        // DKQ/32 of them.
+                        const int el0 = k*h2_per_chunk*2;
+                        uint8_t * dst_b   = (uint8_t *) (tile_KV + i*stride_tile) + el0;
+                        half    * scale_b = (half    *) (tile_KV + i*stride_tile + D2);
+                        if (!oob_check || i < i_sup) {
+                            const block_nvfp4 * row = KV + i*stride_KV;
+                            const float d_rep = transcode_nvfp4_chunk_to_e4m3(row, el0, dst_b);
+                            if (el0 % QK_F8_E4M3 == 0) {
+                                scale_b[el0 / QK_F8_E4M3] = __float2half(d_rep);
+                            }
+                        } else {
+                            ggml_cuda_memcpy_1<8, 2>(dst_b, zero);
+                            if (el0 % QK_F8_E4M3 == 0) {
+                                scale_b[el0 / QK_F8_E4M3] = __float2half(0.0f);
+                            }
+                        }
                     } else {
+                        half2 * dst = tile_KV + i*stride_tile + k*h2_per_chunk;
+                        if (!oob_check || i < i_sup) {
+                            // One 16-byte chunk == h2_per_chunk (4) half2 == 8 NVFP4 elements.
+                            // el0 = k*8 is a multiple of 8, so the whole chunk is decoded in
+                            // one call (single scale conversion + vectorized table decode).
+                            static_assert(h2_per_chunk == 4, "nvfp4 chunk decode assumes 4 half2/chunk");
+                            const block_nvfp4 * row = KV + i*stride_KV;
+                            dequantize_nvfp4_chunk(row, k*h2_per_chunk*2, dst);
+                        } else {
 #pragma unroll
-                        for (int c = 0; c < h2_per_chunk; ++c) {
-                            dst[c] = zero[c];
+                            for (int c = 0; c < h2_per_chunk; ++c) {
+                                dst[c] = zero[c];
+                            }
                         }
                     }
                 }
