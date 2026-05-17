@@ -8959,11 +8959,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_NVFP4));
 
     // NVFP4 KV cache prefill coverage (hsk=hsv=128, Q columns > 2): exercises the
-    // native FP4 flash-attention kernel, which only dispatches for Q->ne[1] > 2.
-    // Sweep the ncols1 selection {3->4, 4->4, 8->8} and include a long-KV case so
-    // parallel_blocks > 1 and the KV-split combine path is verified.
-    for (int nb : {3, 4, 8}) {
+    // fused inline-dequant MMA kernel, which only dispatches for Q->ne[1] > 2 -- and,
+    // under GGML_CUDA_FA_NVFP4_FP8, the FP8 K*Q^T compute path. Sweep the ncols
+    // selection {3,4->4, 8->8, 16->16} so both the narrow and wide MMA are exercised;
+    // include a long-KV case so parallel_blocks > 1 verifies the KV-split combine path.
+    for (int nb : {3, 4, 8, 16}) {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4));
+    }
+    // GQA variants (in-kernel ncols2 > 1): exercise the grouped-head NVFP4 path.
+    // nb is swept past 16 so the largest ncols1 (e.g. ncols1=32, ncols2=2) is covered.
+    for (int nr2 : {2, 4}) {
+        for (int nb : {4, 8, 16, 32, 64}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {nr2, 1}, 256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4));
+        }
+    }
+    for (int kv : {512, 4096}) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {2, 1}, kv, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4));
     }
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 4096,   4, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 4096,   8, true, true,  0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4));
