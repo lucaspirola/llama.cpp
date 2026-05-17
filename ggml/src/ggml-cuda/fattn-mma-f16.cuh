@@ -2445,6 +2445,12 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     template void ggml_cuda_flash_attn_ext_mma_f16_case                                                         \
     <DKQ, DV, ncols1, ncols2, block_f8_e4m3, kq_compute_fp8>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
 
+// NVFP4+FP8 variant: K/V read raw as block_nvfp4 (no f16 scratch), K transcoded to E4M3
+// on load and K*Q^T run on the E4M3 tensor cores.
+#define DECL_FATTN_MMA_F16_CASE_NVFP4_FP8(DKQ, DV, ncols1, ncols2)                                            \
+    template void ggml_cuda_flash_attn_ext_mma_f16_case                                                       \
+    <DKQ, DV, ncols1, ncols2, block_nvfp4, kq_compute_fp8>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
+
 #define DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(DKQ, DV, ncols)   \
     extern DECL_FATTN_MMA_F16_CASE(DKQ, DV, (ncols)/ 1,  1); \
     extern DECL_FATTN_MMA_F16_CASE(DKQ, DV, (ncols)/ 2,  2); \
@@ -2528,3 +2534,15 @@ DECL_FATTN_MMA_F16_CASE_FP8DIRECT_ALL_NCOLS2( 8)
 DECL_FATTN_MMA_F16_CASE_FP8DIRECT_ALL_NCOLS2(16)
 DECL_FATTN_MMA_F16_CASE_FP8DIRECT_ALL_NCOLS2(32)
 DECL_FATTN_MMA_F16_CASE_FP8DIRECT_ALL_NCOLS2(64)
+
+// NVFP4+FP8 (opt-in): NVFP4 KV read raw, K transcoded to E4M3 for the E4M3 MMA, head-dim 128 only.
+#define DECL_FATTN_MMA_F16_CASE_NVFP4_FP8_ALL_NCOLS2(ncols)             \
+    extern DECL_FATTN_MMA_F16_CASE_NVFP4_FP8(128, 128, (ncols)/ 1,  1); \
+    extern DECL_FATTN_MMA_F16_CASE_NVFP4_FP8(128, 128, (ncols)/ 2,  2); \
+    extern DECL_FATTN_MMA_F16_CASE_NVFP4_FP8(128, 128, (ncols)/ 4,  4); \
+    extern DECL_FATTN_MMA_F16_CASE_NVFP4_FP8(128, 128, (ncols)/ 8,  8); \
+
+DECL_FATTN_MMA_F16_CASE_NVFP4_FP8_ALL_NCOLS2( 8)
+DECL_FATTN_MMA_F16_CASE_NVFP4_FP8_ALL_NCOLS2(16)
+DECL_FATTN_MMA_F16_CASE_NVFP4_FP8_ALL_NCOLS2(32)
+DECL_FATTN_MMA_F16_CASE_NVFP4_FP8_ALL_NCOLS2(64)

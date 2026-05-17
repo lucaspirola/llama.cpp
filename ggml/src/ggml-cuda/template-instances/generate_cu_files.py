@@ -38,6 +38,8 @@ SOURCE_FATTN_MMA_NVFP4_CASE = "DECL_FATTN_MMA_F16_CASE_NVFP4({head_size_kq}, {he
 
 SOURCE_FATTN_MMA_FP8DIRECT_CASE = "DECL_FATTN_MMA_F16_CASE_FP8DIRECT({head_size_kq}, {head_size_v}, {ncols1}, {ncols2});\n"
 
+SOURCE_FATTN_MMA_NVFP4_FP8_CASE = "DECL_FATTN_MMA_F16_CASE_NVFP4_FP8({head_size_kq}, {head_size_v}, {ncols1}, {ncols2});\n"
+
 TYPES_MMQ = [
     "GGML_TYPE_Q1_0",
     "GGML_TYPE_Q4_0", "GGML_TYPE_Q4_1", "GGML_TYPE_Q5_0", "GGML_TYPE_Q5_1", "GGML_TYPE_Q8_0",
@@ -112,6 +114,11 @@ for ncols in [8, 16, 32, 64]:
             # FP8-direct variant: head-dim 128 only, ncols2 in {1,2,4,8}.
             if ncols2 in (1, 2, 4, 8):
                 f.write(SOURCE_FATTN_MMA_FP8DIRECT_CASE.format(ncols1=ncols1, ncols2=ncols2, head_size_kq=128, head_size_v=128))
+
+            # NVFP4+FP8 variant (NVFP4 KV routed through the FP8 compute path): head-dim
+            # 128 only, ncols2 in {1,2,4,8}.
+            if ncols2 in (1, 2, 4, 8):
+                f.write(SOURCE_FATTN_MMA_NVFP4_FP8_CASE.format(ncols1=ncols1, ncols2=ncols2, head_size_kq=128, head_size_v=128))
 
 for type in TYPES_MMQ:
     with open(f"mmq-instance-{get_short_name(type)}.cu", "w") as f:
