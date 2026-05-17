@@ -524,9 +524,12 @@ static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, c
 //                            contiguously and the per-block scales go into the tile's
 //                            padding zone, ready for the direct e4m3 MMA.
 // is_V tells the block_f8_e4m3 branch whether it is loading K or V; it is irrelevant for
-// the half2 and block_nvfp4 representations.
+// the half2 representation.
+// KQ_compute_t selects how K is consumed downstream: with kq_compute_fp8 the block_nvfp4
+// K tile (is_V == false) is transcoded to raw E4M3 for the direct e4m3 MMA instead of
+// being dequantized to f16. It is irrelevant for the half2 representation and for V.
 template<int stride_tile, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check,
-        typename KV_src_t = half2, bool is_V = false>
+        typename KV_src_t = half2, bool is_V = false, typename KQ_compute_t = kq_compute_f16>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
         const KV_src_t * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int D2, const int stride_KV, const int i_sup) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -924,7 +927,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
         if constexpr (nstages <= 1) {
             constexpr bool use_cp_async = !is_nvfp4 && !k_tile_has_raw_e4m3 && nstages == 1;
-            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, KV_src_t, false>
+            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, KV_src_t, false, KQ_compute_t>
                 (K_h2 + int64_t(k_VKQ_0)*stride_K + k0_start, tile_K, k0_diff, stride_K, k_VKQ_sup);
             if (use_cp_async) {
                 cp_async_wait_all();
