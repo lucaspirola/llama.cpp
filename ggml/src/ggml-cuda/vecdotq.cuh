@@ -357,6 +357,28 @@ static __device__ __forceinline__ float vec_dot_nvfp4_q8_1(
 
     return sum;
 }
+
+#define VDR_F8_E4M3_Q8_1_MMVQ 2
+
+// FP8 E4M3 weight x q8_1 activation. E4M3 codes are non-integer floats, so this is a
+// float-accumulate dot product (no dp4a). Block params match q8_0 (QK=32, QR=1, QI=8),
+// so the iqs/stride handling mirrors vec_dot_q8_0_q8_1.
+static __device__ __forceinline__ float vec_dot_f8_e4m3_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_f8_e4m3 * bqf = (const block_f8_e4m3 *) vbq + kbx;
+
+    const int j0 = iqs * (int) sizeof(int); // iqs is in 32-bit units; byte offset into the 32-element block
+
+    float sumi = 0.0f;
+#pragma unroll
+    for (int j = 0; j < VDR_F8_E4M3_Q8_1_MMVQ * (int) sizeof(int); ++j) {
+        sumi += ggml_cuda_se4m3_to_fp32(bqf->qs[j0 + j]) * (float) bq8_1->qs[j0 + j];
+    }
+
+    return (__half2float(bqf->d) * __low2float(bq8_1->ds)) * sumi;
+}
+
 #define VDR_Q2_K_Q8_1_MMVQ 1
 #define VDR_Q2_K_Q8_1_MMQ  4
 

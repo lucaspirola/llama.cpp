@@ -2547,10 +2547,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
     bool use_mul_mat_f     = !ggml_is_quantized(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+    // FP8 E4M3 has no integer dp4a path: it uses the MMVQ float-accumulate GEMV (decode /
+    // small batches) and the dequant -> f16 cuBLAS GEMM (large prefill); it has no MMQ kernel.
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
         && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
     bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
+        && src0->type != GGML_TYPE_F8_E4M3
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
     bool any_gpus_with_slow_fp16 = false;
@@ -5160,6 +5163,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
+                    case GGML_TYPE_F8_E4M3:
                         return true;
                     default:
                         return false;
@@ -5194,7 +5198,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                        op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
                        op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 ||
-                       op->type == GGML_TYPE_IQ4_NL || op->type == GGML_TYPE_NVFP4) &&
+                       op->type == GGML_TYPE_IQ4_NL || op->type == GGML_TYPE_NVFP4 ||
+                       op->type == GGML_TYPE_F8_E4M3) &&
                        op->src[0]->type == GGML_TYPE_F32 &&
                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
             } break;
@@ -5252,6 +5257,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 // path exists -- just as it is for IQ4_NL; flash attention reads the
                 // NVFP4 KV cache directly without going through CPY.
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_NVFP4) {
+                    return true;
+                }
+                // F8_E4M3, like NVFP4, is a copy destination only (quantize-on-write to
+                // the KV cache); flash attention reads the F8_E4M3 KV cache directly.
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F8_E4M3) {
                     return true;
                 }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_I32) {

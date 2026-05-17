@@ -7518,7 +7518,7 @@ static const ggml_type all_types[] = {
     GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q1_0,
-    GGML_TYPE_MXFP4, GGML_TYPE_NVFP4,
+    GGML_TYPE_MXFP4, GGML_TYPE_NVFP4, GGML_TYPE_F8_E4M3,
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
     GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
     GGML_TYPE_Q6_K,
@@ -7535,7 +7535,7 @@ static const ggml_type base_types[] = {
     GGML_TYPE_Q4_0,
     GGML_TYPE_Q4_1, // for I8MM tests
     GGML_TYPE_Q4_K,
-    GGML_TYPE_MXFP4, GGML_TYPE_NVFP4, // TODO: or "other"
+    GGML_TYPE_MXFP4, GGML_TYPE_NVFP4, GGML_TYPE_F8_E4M3, // TODO: or "other"
     GGML_TYPE_IQ2_XXS
 };
 
@@ -8916,7 +8916,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                             for (int nb : { 1, 3, 32, 75, }) {
                                                 for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_DEFAULT}) {
                                                     if (hsk != 128 && prec == GGML_PREC_DEFAULT) continue;
-                                                    for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL, GGML_TYPE_NVFP4}) {
+                                                    for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL, GGML_TYPE_NVFP4, GGML_TYPE_F8_E4M3}) {
                                                         if (type_KV != GGML_TYPE_F16 && hsk != 64 && hsk != 72) continue;
                                                         test_cases.emplace_back(new test_flash_attn_ext(
                                                                     hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, type_KV));
@@ -8972,6 +8972,40 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Non-contiguous (permuted) NVFP4 K/V prefill: exercises the row-stride-driven
     // loader of the fused inline-dequant MMA kernel with genuine NVFP4 row strides.
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  256,   4, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4, {0, 2, 1, 3}));
+
+    // F8_E4M3 KV cache extra coverage. The type_KV loop only generates quantized cases
+    // at hsk 64/72, so add an explicit hsk=128 case (the common Llama head size).
+    // F8_E4M3 KV runs the VEC kernel for small batches; for hsk=128 prefill it runs the
+    // FP8 K*Q^T compute MMA kernel on Ada (sm_89+) and the f16-scratch MMA path below Ada.
+    // The mixed F8_E4M3/F16 pairs only dispatch a kernel on builds with the full quant
+    // matrix (-DGGML_CUDA_FA_ALL_QUANTS); on a standard build they report "not supported",
+    // like the q8_0/q4_0 mixed cases.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3));
+    test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F8_E4M3, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,     GGML_TYPE_F8_E4M3));
+
+    // F8_E4M3 KV cache prefill coverage (hsk=hsv=128, Q columns > 2): sweep the ncols
+    // selection {3,4->ncols 4, 8->8, 16->16} so both the narrow and wide FP8 K*Q^T MMA
+    // are exercised; include a long-KV case so parallel_blocks > 1 exercises the KV-split
+    // combine path, plus max_bias / logit_softcap / permuted variants.
+    for (int nb : {3, 4, 8, 16}) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3));
+    }
+    // GQA variants (in-kernel ncols2 > 1): exercise the FP8 K*Q^T path with grouped heads.
+    // nb is swept past 16 so the largest ncols1 (e.g. ncols1=32, ncols2=2) is also covered.
+    for (int nr2 : {2, 4}) {
+        for (int nb : {4, 8, 16, 32, 64}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {nr2, 1}, 256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3));
+        }
+    }
+    for (int kv : {512, 4096}) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {2, 1}, kv, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 4096,   4, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 4096,   8, true, true,  0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  256,   4, true, false, 8.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  256,   4, true, false, 0.0f, 8.0f, GGML_PREC_F32, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  256,   4, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3, {0, 2, 1, 3}));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));

@@ -6,32 +6,32 @@
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
 
-template <int DKQ, int DV, int ncols2, typename KV_src_t = half2>
+template <int DKQ, int DV, int ncols2, typename KV_src_t = half2, typename KQ_compute_t = kq_compute_f16>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * Q = dst->src[0];
 
     if constexpr (ncols2 <= 8) {
         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
-            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2, KV_src_t>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2, KV_src_t, KQ_compute_t>(ctx, dst);
             return;
         }
     }
 
     if constexpr (ncols2 <= 16) {
         if (Q->ne[1] <= 16/ncols2) {
-            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2, KV_src_t>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2, KV_src_t, KQ_compute_t>(ctx, dst);
             return;
         }
     }
 
     if (Q->ne[1] <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
             (GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256)) {
-        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2, KV_src_t>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2, KV_src_t, KQ_compute_t>(ctx, dst);
         return;
     }
 
-    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2, KV_src_t>(ctx, dst);
+    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2, KV_src_t, KQ_compute_t>(ctx, dst);
 }
 
 template <int DKQ, int DV>
@@ -146,6 +146,43 @@ static void ggml_cuda_flash_attn_ext_mma_f16_nvfp4(ggml_backend_cuda_context & c
     ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<128, 128, 1, block_nvfp4>(ctx, dst);
 }
 
+// F8_E4M3 KV-cache: FP8-direct variant of the f16 MMA kernel, head-dim 128 only.
+// KV_src_t is block_f8_e4m3, so launch_fattn allocates no f16 scratch: the kernel reads
+// the raw E4M3 K/V blocks straight from the cache and runs K*Q^T on the FP8 tensor
+// cores. (Phase 1: K is dequantized to f16 then requantized to e4m3 in-kernel; the
+// later subtasks pack K raw for the direct MMA.) The ncols2 selection mirrors
+// ggml_cuda_flash_attn_ext_mma_f16_nvfp4.
+static void ggml_cuda_flash_attn_ext_mma_f16_fp8direct(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * KQV  = dst;
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * mask = dst->src[3];
+
+    GGML_ASSERT(Q->ne[0] == 128 && dst->src[2]->ne[0] == 128);
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+
+    const bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+    if (use_gqa_opt && gqa_ratio > 4) {
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<128, 128, 8, block_f8_e4m3, kq_compute_fp8>(ctx, dst);
+        return;
+    }
+    if (use_gqa_opt && gqa_ratio > 2) {
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<128, 128, 4, block_f8_e4m3, kq_compute_fp8>(ctx, dst);
+        return;
+    }
+    if (use_gqa_opt && gqa_ratio > 1) {
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<128, 128, 2, block_f8_e4m3, kq_compute_fp8>(ctx, dst);
+        return;
+    }
+    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<128, 128, 1, block_f8_e4m3, kq_compute_fp8>(ctx, dst);
+}
+
 static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * KQV  = dst;
@@ -160,6 +197,15 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     if (K->type == GGML_TYPE_NVFP4 && V->type == GGML_TYPE_NVFP4
             && Q->ne[0] == 128 && V->ne[0] == 128) {
         ggml_cuda_flash_attn_ext_mma_f16_nvfp4(ctx, dst);
+        return;
+    }
+
+    // F8_E4M3 KV-cache with head-dim 128 routes to the FP8-direct variant on Ada
+    // (sm_89) and newer. Below Ada (no FP8 tensor cores) it falls through to the standard
+    // f16 MMA path, which still works (launch_fattn converts F8_E4M3 K/V to f16 scratch).
+    if (K->type == GGML_TYPE_F8_E4M3 && V->type == GGML_TYPE_F8_E4M3
+            && Q->ne[0] == 128 && V->ne[0] == 128 && cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+        ggml_cuda_flash_attn_ext_mma_f16_fp8direct(ctx, dst);
         return;
     }
 
@@ -307,83 +353,102 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     ggml_tensor * V = dst->src[2];
 
 #ifdef GGML_CUDA_FA_ALL_QUANTS
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_F16)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1, GGML_TYPE_F16)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0, GGML_TYPE_F16)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_F16)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_F16)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_F16)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_NVFP4, GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,     GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0,    GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1,    GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0,    GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1,    GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,    GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16,    GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_NVFP4,   GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F8_E4M3, GGML_TYPE_F16)
 
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_Q4_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1, GGML_TYPE_Q4_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0, GGML_TYPE_Q4_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q4_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_Q4_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_NVFP4, GGML_TYPE_Q4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,     GGML_TYPE_Q4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0,    GGML_TYPE_Q4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1,    GGML_TYPE_Q4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0,    GGML_TYPE_Q4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1,    GGML_TYPE_Q4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,    GGML_TYPE_Q4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16,    GGML_TYPE_Q4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_NVFP4,   GGML_TYPE_Q4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F8_E4M3, GGML_TYPE_Q4_0)
 
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_Q4_1)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_1)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1, GGML_TYPE_Q4_1)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0, GGML_TYPE_Q4_1)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q4_1)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q4_1)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_Q4_1)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_NVFP4, GGML_TYPE_Q4_1)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,     GGML_TYPE_Q4_1)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0,    GGML_TYPE_Q4_1)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1,    GGML_TYPE_Q4_1)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0,    GGML_TYPE_Q4_1)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1,    GGML_TYPE_Q4_1)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,    GGML_TYPE_Q4_1)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16,    GGML_TYPE_Q4_1)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_NVFP4,   GGML_TYPE_Q4_1)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F8_E4M3, GGML_TYPE_Q4_1)
 
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_Q5_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q5_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1, GGML_TYPE_Q5_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0, GGML_TYPE_Q5_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q5_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q5_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_Q5_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_NVFP4, GGML_TYPE_Q5_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,     GGML_TYPE_Q5_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0,    GGML_TYPE_Q5_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1,    GGML_TYPE_Q5_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0,    GGML_TYPE_Q5_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1,    GGML_TYPE_Q5_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,    GGML_TYPE_Q5_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16,    GGML_TYPE_Q5_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_NVFP4,   GGML_TYPE_Q5_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F8_E4M3, GGML_TYPE_Q5_0)
 
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_Q5_1)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q5_1)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1, GGML_TYPE_Q5_1)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0, GGML_TYPE_Q5_1)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q5_1)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q5_1)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_Q5_1)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_NVFP4, GGML_TYPE_Q5_1)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,     GGML_TYPE_Q5_1)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0,    GGML_TYPE_Q5_1)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1,    GGML_TYPE_Q5_1)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0,    GGML_TYPE_Q5_1)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1,    GGML_TYPE_Q5_1)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,    GGML_TYPE_Q5_1)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16,    GGML_TYPE_Q5_1)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_NVFP4,   GGML_TYPE_Q5_1)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F8_E4M3, GGML_TYPE_Q5_1)
 
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_Q8_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q8_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1, GGML_TYPE_Q8_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0, GGML_TYPE_Q8_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q8_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_Q8_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_NVFP4, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,     GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0,    GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1,    GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0,    GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1,    GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,    GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16,    GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_NVFP4,   GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F8_E4M3, GGML_TYPE_Q8_0)
 
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_BF16)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_BF16)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1, GGML_TYPE_BF16)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0, GGML_TYPE_BF16)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_BF16)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_BF16)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_NVFP4, GGML_TYPE_BF16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,     GGML_TYPE_BF16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0,    GGML_TYPE_BF16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1,    GGML_TYPE_BF16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0,    GGML_TYPE_BF16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1,    GGML_TYPE_BF16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,    GGML_TYPE_BF16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16,    GGML_TYPE_BF16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_NVFP4,   GGML_TYPE_BF16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F8_E4M3, GGML_TYPE_BF16)
 
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,   GGML_TYPE_NVFP4)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0,  GGML_TYPE_NVFP4)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1,  GGML_TYPE_NVFP4)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0,  GGML_TYPE_NVFP4)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1,  GGML_TYPE_NVFP4)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,  GGML_TYPE_NVFP4)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16,  GGML_TYPE_NVFP4)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_NVFP4, GGML_TYPE_NVFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,     GGML_TYPE_NVFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0,    GGML_TYPE_NVFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1,    GGML_TYPE_NVFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0,    GGML_TYPE_NVFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1,    GGML_TYPE_NVFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,    GGML_TYPE_NVFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16,    GGML_TYPE_NVFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_NVFP4,   GGML_TYPE_NVFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F8_E4M3, GGML_TYPE_NVFP4)
+
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,     GGML_TYPE_F8_E4M3)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0,    GGML_TYPE_F8_E4M3)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1,    GGML_TYPE_F8_E4M3)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0,    GGML_TYPE_F8_E4M3)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1,    GGML_TYPE_F8_E4M3)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,    GGML_TYPE_F8_E4M3)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16,    GGML_TYPE_F8_E4M3)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_NVFP4,   GGML_TYPE_F8_E4M3)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3)
 #else
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,   GGML_TYPE_F16)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0,  GGML_TYPE_Q4_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,  GGML_TYPE_Q8_0)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16,  GGML_TYPE_BF16)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_NVFP4, GGML_TYPE_NVFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,     GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0,    GGML_TYPE_Q4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,    GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16,    GGML_TYPE_BF16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_NVFP4,   GGML_TYPE_NVFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -502,6 +567,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
         case GGML_TYPE_NVFP4:
+        case GGML_TYPE_F8_E4M3:
             break;
         default:
             return BEST_FATTN_KERNEL_NONE;
@@ -538,7 +604,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             }
         }
         // NVFP4 KV-cache prefill (head-dim 128) is handled by the fused inline-dequant
-        // variant of the f16 MMA kernel; see ggml_cuda_flash_attn_ext_mma_f16.
+        // variant of the f16 MMA kernel; see ggml_cuda_flash_attn_ext_mma_f16. F8_E4M3
+        // KV also routes here but uses the standard f16-scratch conversion (no fused kernel).
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
