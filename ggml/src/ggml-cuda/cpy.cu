@@ -372,6 +372,36 @@ static void ggml_cpy_f32_iq4_nl_cuda(
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
+// Warp-per-block F32->NVFP4 copy kernel. The NVFP4 quantizer does a full-range
+// UE4M3 scale scan, which is warp-cooperative (one 32-lane warp per block_nvfp4),
+// so this kernel can't reuse the generic 1-thread-per-block cpy_f32_q. The index
+// arithmetic mirrors cpy_f32_q exactly; only the block->lane mapping differs.
+static __global__ void cpy_f32_nvfp4_warp(const char * cx, char * cdst, const int64_t ne,
+                                          const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+                                          const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
+                                          const int64_t nb12, const int64_t nb13) {
+    const int64_t block_idx = (int64_t) blockIdx.x*blockDim.y + threadIdx.y;
+    const int64_t i = block_idx*QK_NVFP4;
+
+    if (i >= ne) {
+        return;
+    }
+
+    const int64_t i03 = i/(ne00 * ne01 * ne02);
+    const int64_t i02 = (i - i03*ne00*ne01*ne02 )/ (ne00*ne01);
+    const int64_t i01 = (i - i03*ne00*ne01*ne02  -  i02*ne01*ne00) / ne00;
+    const int64_t i00 = i - i03*ne00*ne01*ne02 - i02*ne01*ne00 - i01*ne00;
+    const int64_t x_offset = i00*nb00 + i01*nb01 + i02*nb02 + i03 * nb03;
+
+    const int64_t i13 = i/(ne10 * ne11 * ne12);
+    const int64_t i12 = (i - i13*ne10*ne11*ne12) / (ne10*ne11);
+    const int64_t i11 = (i - i13*ne10*ne11*ne12 - i12*ne10*ne11) / ne10;
+    const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
+    const int64_t dst_offset = (i10/QK_NVFP4)*nb10 + i11*nb11 + i12*nb12 + i13*nb13;
+
+    quantize_f32_nvfp4_block_warp((const float *)(cx + x_offset), (block_nvfp4 *)(cdst + dst_offset));
+}
+
 static void ggml_cpy_f32_nvfp4_cuda(
     const char * cx, char * cdst, const int64_t ne,
     const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
@@ -380,7 +410,9 @@ static void ggml_cpy_f32_nvfp4_cuda(
     GGML_ASSERT(ne % QK_NVFP4 == 0);
     const int64_t num_blocks = ne / QK_NVFP4;
     GGML_ASSERT(num_blocks < UINT_MAX);
-    cpy_f32_q<cpy_blck_f32_nvfp4, QK_NVFP4><<<num_blocks, 1, 0, stream>>>
+    const dim3 block_dims(32, 8, 1);
+    const int64_t grid = (num_blocks + 8 - 1) / 8;
+    cpy_f32_nvfp4_warp<<<grid, block_dims, 0, stream>>>
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
