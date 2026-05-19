@@ -256,6 +256,43 @@ static void ggml_cuda_flash_attn_ext_mma_f16_nvfp4_fp8(ggml_backend_cuda_context
     ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<128, 128, 1, block_nvfp4, kq_compute_fp8>(ctx, dst);
 }
 
+// MXFP4 KV-cache routed through the FP8 (E4M3) compute path: KV_src_t is block_mxfp4 and
+// KQ_compute_t is kq_compute_fp8, so launch_fattn allocates no f16 scratch -- the kernel
+// reads the raw MXFP4 blocks, transcodes K to E4M3 on load and runs K*Q^T on the FP8
+// tensor cores. Opt-in (GGML_CUDA_FA_MXFP4_FP8); like the NVFP4+FP8 path, on consumer
+// Blackwell it is neither faster nor more accurate than the default f16 K*Q^T path
+// (ggml_cuda_flash_attn_ext_mma_f16_mxfp4). The ncols2 selection mirrors that path.
+static void ggml_cuda_flash_attn_ext_mma_f16_mxfp4_fp8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * KQV  = dst;
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * mask = dst->src[3];
+
+    GGML_ASSERT(Q->ne[0] == 128 && dst->src[2]->ne[0] == 128);
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+
+    const bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+    if (use_gqa_opt && gqa_ratio > 4) {
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<128, 128, 8, block_mxfp4, kq_compute_fp8>(ctx, dst);
+        return;
+    }
+    if (use_gqa_opt && gqa_ratio > 2) {
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<128, 128, 4, block_mxfp4, kq_compute_fp8>(ctx, dst);
+        return;
+    }
+    if (use_gqa_opt && gqa_ratio > 1) {
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<128, 128, 2, block_mxfp4, kq_compute_fp8>(ctx, dst);
+        return;
+    }
+    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<128, 128, 1, block_mxfp4, kq_compute_fp8>(ctx, dst);
+}
+
 static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * KQV  = dst;
@@ -286,7 +323,15 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     // MMA path (launch_fattn converts MXFP4 K/V to f16 scratch buffers).
     if (K->type == GGML_TYPE_MXFP4 && V->type == GGML_TYPE_MXFP4
             && Q->ne[0] == 128 && V->ne[0] == 128) {
-        ggml_cuda_flash_attn_ext_mma_f16_mxfp4(ctx, dst);
+        // Opt-in: GGML_CUDA_FA_MXFP4_FP8 routes MXFP4 KV through the FP8 (E4M3) compute
+        // path on Ada+. The default keeps K*Q^T in f16, which is faster and more accurate
+        // on consumer Blackwell; see ggml_cuda_flash_attn_ext_mma_f16_mxfp4_fp8.
+        static const bool mxfp4_fp8 = getenv("GGML_CUDA_FA_MXFP4_FP8") != nullptr;
+        if (mxfp4_fp8 && cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+            ggml_cuda_flash_attn_ext_mma_f16_mxfp4_fp8(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_mma_f16_mxfp4(ctx, dst);
+        }
         return;
     }
 

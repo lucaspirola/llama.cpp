@@ -944,6 +944,62 @@ static __device__ __forceinline__ float transcode_nvfp4_chunk_to_e4m3(
 #endif // FP8_MMA_AVAILABLE
 }
 
+// Transcode one 16-byte tile chunk (8 consecutive MXFP4 elements el0 .. el0+7 of a K
+// row) to raw E4M3 for the direct e4m3 MMA: dst_e4m3 receives 8 packed E4M3 bytes, the
+// element el0+j landing at byte j, in the order load_tile_e4m3_direct expects. Returns
+// the scale of the 32-k MMA slice this chunk belongs to.
+//
+// Simpler than transcode_nvfp4_chunk_to_e4m3: MXFP4 carries one E8M0 scale per
+// 32-element block and QK_MXFP4 == QK_F8_E4M3, so a 32-k MMA slice is exactly one
+// MXFP4 block with exactly one scale -- no "representative scale" / per-code ratio.
+// The E4M3 values are the raw 2*E2M1 codes (|code| <= 12, exact in E4M3); the compute
+// path multiplies the f32 accumulator by the returned scale.
+static __device__ __forceinline__ float transcode_mxfp4_chunk_to_e4m3(
+        const block_mxfp4 * __restrict__ row_base, const int el0, uint8_t * __restrict__ dst_e4m3) {
+#ifdef FP8_MMA_AVAILABLE
+    static_assert(QK_MXFP4 == QK_F8_E4M3, "mxfp4 block must equal one 32-k e4m3 MMA slice");
+
+    const int ib    = el0 /  QK_MXFP4;
+    const int il    = el0 %  QK_MXFP4;
+    const int shift = il / (QK_MXFP4/2);                // 0 -> low nibble, 1 -> high nibble
+    const int g0    = (il % (QK_MXFP4/2)) / 4;          // first of two 4-byte qs groups
+
+    const block_mxfp4 & xb = row_base[ib];
+
+    const int2 t0 = get_int_from_table_16(get_int_b1(xb.qs, g0 + 0), kvalues_mxfp4);
+    const int2 t1 = get_int_from_table_16(get_int_b1(xb.qs, g0 + 1), kvalues_mxfp4);
+    const int  v0 = shift ? t0.y : t0.x; // codes for elements el0+0 .. el0+3
+    const int  v1 = shift ? t1.y : t1.x; // codes for elements el0+4 .. el0+7
+
+    // kvalues_mxfp4 stores 2*E2M1; the compensating 0.5 factor is folded into the scale.
+    const float d_rep = ggml_cuda_e8m0_to_fp32(xb.e) * 0.5f;
+
+    const int8_t * c0 = (const int8_t *) &v0;
+    const int8_t * c1 = (const int8_t *) &v1;
+
+    // Convert each pair of raw codes to E4M3 with the hardware f16->e4m3 cvt; the
+    // resulting uint16 holds element el0+2j in its low byte and el0+2j+1 in its high
+    // byte, matching the m16n8k32 A-operand byte order load_tile_e4m3_direct reads back.
+    uint16_t e[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int8_t * c = j < 2 ? c0 : c1;
+        const int      b = 2*(j & 1);
+        const half2 pair = __floats2half2_rn(c[b + 0], c[b + 1]);
+        asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(e[j]) : "r"(*(const uint32_t *) &pair));
+    }
+
+    const uint32_t packed[2] = { (uint32_t) e[0] | ((uint32_t) e[1] << 16),
+                                 (uint32_t) e[2] | ((uint32_t) e[3] << 16) };
+    ggml_cuda_memcpy_1<8, 4>(dst_e4m3, packed);
+    return d_rep;
+#else
+    GGML_UNUSED_VARS(row_base, el0, dst_e4m3);
+    NO_DEVICE_CODE;
+    return 0.0f;
+#endif // FP8_MMA_AVAILABLE
+}
+
 // Dequantize one 16-byte tile chunk: 8 consecutive F8_E4M3 elements (el0 .. el0+7)
 // of a K/V row into 4 half2. row_base points at the first block_f8_e4m3 of the row;
 // el0 is the element index within the row and must be a multiple of 8.

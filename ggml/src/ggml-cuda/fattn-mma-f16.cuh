@@ -614,10 +614,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
         ggml_cuda_unroll<6>{}(load);
         return;
     } else if constexpr (std::is_same_v<KV_src_t, block_mxfp4>) {
-        // MXFP4 path: synchronous plain loads of the 17-byte blocks. K and V are both
-        // dequantized inline to the shared f16 tile (one E8M0 scale per 32-element
-        // block -- no FP8 compute path, no sub-block split). block_mxfp4 is not a
-        // 16-byte multiple so cp.async is not used here.
+        // MXFP4 path: synchronous plain loads of the 17-byte blocks. K/V are dequantized
+        // to f16, except K under the FP8 compute path which is transcoded to raw e4m3.
+        // block_mxfp4 is not a 16-byte multiple so cp.async is not used here.
         static_assert(!use_cp_async, "cp_async not supported for block_mxfp4 tiles");
         static_assert(h2_per_chunk == 4, "mxfp4 chunk decode assumes 4 half2/chunk");
         const half2 zero[4] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
@@ -643,16 +642,39 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                 for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
                     const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
 
-                    half2 * dst = tile_KV + i*stride_tile + k*h2_per_chunk;
-                    if (!oob_check || i < i_sup) {
-                        // One 16-byte chunk == h2_per_chunk (4) half2 == 8 MXFP4 elements;
-                        // el0 = k*8 is a multiple of 8, so the whole chunk shares one block.
-                        const block_mxfp4 * row = KV + i*stride_KV;
-                        dequantize_mxfp4_chunk(row, k*h2_per_chunk*2, dst);
+                    if constexpr (!is_V && std::is_same_v<KQ_compute_t, kq_compute_fp8>) {
+                        // MXFP4 K + FP8 compute: transcode the chunk to raw e4m3 bytes
+                        // packed contiguously and store the 32-k slice's scale in the tile
+                        // padding zone, exactly like the block_nvfp4 FP8 K-mode. QK_MXFP4
+                        // == QK_F8_E4M3 == 32, so one block is one MMA slice = one scale.
+                        const int el0 = k*h2_per_chunk*2;
+                        uint8_t * dst_b   = (uint8_t *) (tile_KV + i*stride_tile) + el0;
+                        half    * scale_b = (half    *) (tile_KV + i*stride_tile + D2);
+                        if (!oob_check || i < i_sup) {
+                            const block_mxfp4 * row = KV + i*stride_KV;
+                            const float d_rep = transcode_mxfp4_chunk_to_e4m3(row, el0, dst_b);
+                            if (el0 % QK_F8_E4M3 == 0) {
+                                scale_b[el0 / QK_F8_E4M3] = __float2half(d_rep);
+                            }
+                        } else {
+                            ggml_cuda_memcpy_1<8, 2>(dst_b, zero);
+                            if (el0 % QK_F8_E4M3 == 0) {
+                                scale_b[el0 / QK_F8_E4M3] = __float2half(0.0f);
+                            }
+                        }
                     } else {
+                        half2 * dst = tile_KV + i*stride_tile + k*h2_per_chunk;
+                        if (!oob_check || i < i_sup) {
+                            // One 16-byte chunk == h2_per_chunk (4) half2 == 8 MXFP4
+                            // elements; el0 = k*8 is a multiple of 8, so the whole chunk
+                            // shares one block.
+                            const block_mxfp4 * row = KV + i*stride_KV;
+                            dequantize_mxfp4_chunk(row, k*h2_per_chunk*2, dst);
+                        } else {
 #pragma unroll
-                        for (int c = 0; c < h2_per_chunk; ++c) {
-                            dst[c] = zero[c];
+                            for (int c = 0; c < h2_per_chunk; ++c) {
+                                dst[c] = zero[c];
+                            }
                         }
                     }
                 }
@@ -952,7 +974,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     // The K tile holds raw E4M3 bytes (+ per-32-k-block scales in the padding zone) ready
     // for the direct E4M3 MMA when K is stored as block_f8_e4m3, or as block_nvfp4 routed
     // through the FP8 compute path (NVFP4 is transcoded to E4M3 on load).
-    constexpr bool k_tile_has_raw_e4m3 = std::is_same_v<KV_src_t, block_f8_e4m3> || (is_nvfp4 && use_fp8_kq);
+    constexpr bool k_tile_has_raw_e4m3 = std::is_same_v<KV_src_t, block_f8_e4m3> || ((is_nvfp4 || is_mxfp4) && use_fp8_kq);
     // NVFP4, MXFP4 and raw-E4M3 K/V are loaded with synchronous plain loads + inline
     // dequant, so the cp.async pipeline is disabled for them (nstages forced to 0).
     constexpr int  nstages         = is_nvfp4 || is_mxfp4 || k_tile_has_raw_e4m3 ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
@@ -1642,7 +1664,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     // See flash_attn_ext_f16_iter: the K tile holds raw E4M3 for block_f8_e4m3 and for
     // block_nvfp4 routed through the FP8 compute path.
-    constexpr bool k_tile_has_raw_e4m3 = std::is_same_v<KV_src_t, block_f8_e4m3> || (is_nvfp4 && use_fp8_kq);
+    constexpr bool k_tile_has_raw_e4m3 = std::is_same_v<KV_src_t, block_f8_e4m3> || ((is_nvfp4 || is_mxfp4) && use_fp8_kq);
     // NVFP4, MXFP4 and raw-E4M3 K/V use synchronous plain loads + inline dequant, so
     // multi-stage cp.async is off.
     constexpr int  nstages         = is_nvfp4 || is_mxfp4 || k_tile_has_raw_e4m3 ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
@@ -2412,7 +2434,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
     // The K tile holds raw E4M3 for block_f8_e4m3 and for block_nvfp4 routed through the
     // FP8 compute path; both skip the f16 K/V scratch and the cp.async pipeline.
-    constexpr bool k_tile_has_raw_e4m3 = std::is_same_v<KV_src_t, block_f8_e4m3> || (is_nvfp4 && is_fp8_kq);
+    constexpr bool k_tile_has_raw_e4m3 = std::is_same_v<KV_src_t, block_f8_e4m3> || ((is_nvfp4 || is_mxfp4) && is_fp8_kq);
 
     const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
     const int  nbatch_fa      = ggml_cuda_fattn_mma_get_nbatch_fa     (DKQ, DV, ncols, cc);
@@ -2506,6 +2528,12 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 #define DECL_FATTN_MMA_F16_CASE_NVFP4_FP8(DKQ, DV, ncols1, ncols2)                                            \
     template void ggml_cuda_flash_attn_ext_mma_f16_case                                                       \
     <DKQ, DV, ncols1, ncols2, block_nvfp4, kq_compute_fp8>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
+
+// MXFP4+FP8 variant: K/V read raw as block_mxfp4 (no f16 scratch), K transcoded to E4M3
+// on load and K*Q^T run on the E4M3 tensor cores.
+#define DECL_FATTN_MMA_F16_CASE_MXFP4_FP8(DKQ, DV, ncols1, ncols2)                                            \
+    template void ggml_cuda_flash_attn_ext_mma_f16_case                                                       \
+    <DKQ, DV, ncols1, ncols2, block_mxfp4, kq_compute_fp8>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
 
 #define DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(DKQ, DV, ncols)   \
     extern DECL_FATTN_MMA_F16_CASE(DKQ, DV, (ncols)/ 1,  1); \
@@ -2602,3 +2630,14 @@ DECL_FATTN_MMA_F16_CASE_NVFP4_FP8_ALL_NCOLS2( 8)
 DECL_FATTN_MMA_F16_CASE_NVFP4_FP8_ALL_NCOLS2(16)
 DECL_FATTN_MMA_F16_CASE_NVFP4_FP8_ALL_NCOLS2(32)
 DECL_FATTN_MMA_F16_CASE_NVFP4_FP8_ALL_NCOLS2(64)
+
+#define DECL_FATTN_MMA_F16_CASE_MXFP4_FP8_ALL_NCOLS2(ncols)             \
+    extern DECL_FATTN_MMA_F16_CASE_MXFP4_FP8(128, 128, (ncols)/ 1,  1); \
+    extern DECL_FATTN_MMA_F16_CASE_MXFP4_FP8(128, 128, (ncols)/ 2,  2); \
+    extern DECL_FATTN_MMA_F16_CASE_MXFP4_FP8(128, 128, (ncols)/ 4,  4); \
+    extern DECL_FATTN_MMA_F16_CASE_MXFP4_FP8(128, 128, (ncols)/ 8,  8); \
+
+DECL_FATTN_MMA_F16_CASE_MXFP4_FP8_ALL_NCOLS2( 8)
+DECL_FATTN_MMA_F16_CASE_MXFP4_FP8_ALL_NCOLS2(16)
+DECL_FATTN_MMA_F16_CASE_MXFP4_FP8_ALL_NCOLS2(32)
+DECL_FATTN_MMA_F16_CASE_MXFP4_FP8_ALL_NCOLS2(64)
