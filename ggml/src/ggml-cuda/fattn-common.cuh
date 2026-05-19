@@ -844,6 +844,42 @@ static __device__ __forceinline__ void dequantize_nvfp4_chunk(
     dst[3] = d * make_half2(c1[2], c1[3]);
 }
 
+// Dequantize one 16-byte tile chunk: 8 consecutive MXFP4 elements (el0 .. el0+7) of a
+// K/V row into 4 half2. row_base points at the first block_mxfp4 of the row; el0 is the
+// element index within the row and must be a multiple of 8.
+//
+// Because QK_MXFP4 == 32 and el0 is a multiple of 8, all 8 elements share the same
+// block, the same E8M0 scale and the same nibble half, and the 8 packed bytes are
+// exactly two 4-byte groups of qs[]. The 8 4-bit codes are decoded with two
+// get_int_from_table_16 calls (as in vec_dot_fattn_vec_KQ_mxfp4) and the E8M0 scale is
+// converted only once. Simpler than dequantize_nvfp4_chunk -- no sub-block split.
+static __device__ __forceinline__ void dequantize_mxfp4_chunk(
+        const block_mxfp4 * __restrict__ row_base, const int el0, half2 * __restrict__ dst) {
+    const int ib    = el0 /  QK_MXFP4;                  // mxfp4 block within the row
+    const int il    = el0 %  QK_MXFP4;                  // element within block (0,8,16,24)
+    const int shift = il / (QK_MXFP4/2);                // 0 -> low nibble, 1 -> high nibble
+    const int g0    = (il % (QK_MXFP4/2)) / 4;          // first of two 4-byte qs groups
+
+    const block_mxfp4 & xb = row_base[ib];
+
+    // Each get_int_from_table_16 decodes a 4-byte group into an int2 whose .x holds the
+    // 4 low-nibble values and .y the 4 high-nibble values, each as 4 packed int8.
+    const int2 t0 = get_int_from_table_16(get_int_b1(xb.qs, g0 + 0), kvalues_mxfp4);
+    const int2 t1 = get_int_from_table_16(get_int_b1(xb.qs, g0 + 1), kvalues_mxfp4);
+    const int  v0 = shift ? t0.y : t0.x; // codes for elements el0+0 .. el0+3
+    const int  v1 = shift ? t1.y : t1.x; // codes for elements el0+4 .. el0+7
+
+    // kvalues_mxfp4 stores 2*E2M1; the compensating 0.5 factor is folded into d.
+    const half2 d = __half2half2((half) (ggml_cuda_e8m0_to_fp32(xb.e) * 0.5f));
+
+    const int8_t * c0 = (const int8_t *) &v0;
+    const int8_t * c1 = (const int8_t *) &v1;
+    dst[0] = d * make_half2(c0[0], c0[1]);
+    dst[1] = d * make_half2(c0[2], c0[3]);
+    dst[2] = d * make_half2(c1[0], c1[1]);
+    dst[3] = d * make_half2(c1[2], c1[3]);
+}
+
 // Transcode one 16-byte tile chunk (8 consecutive NVFP4 elements el0 .. el0+7 of a K
 // row) to raw E4M3 for the direct e4m3 MMA: dst_e4m3 receives 8 packed E4M3 bytes, the
 // element el0+j landing at byte j, in the little-endian order load_tile_e4m3_direct

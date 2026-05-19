@@ -36,6 +36,8 @@ SOURCE_FATTN_MMA_CASE = "DECL_FATTN_MMA_F16_CASE({head_size_kq}, {head_size_v}, 
 
 SOURCE_FATTN_MMA_NVFP4_CASE = "DECL_FATTN_MMA_F16_CASE_NVFP4({head_size_kq}, {head_size_v}, {ncols1}, {ncols2});\n"
 
+SOURCE_FATTN_MMA_MXFP4_CASE = "DECL_FATTN_MMA_F16_CASE_MXFP4({head_size_kq}, {head_size_v}, {ncols1}, {ncols2});\n"
+
 SOURCE_FATTN_MMA_FP8DIRECT_CASE = "DECL_FATTN_MMA_F16_CASE_FP8DIRECT({head_size_kq}, {head_size_v}, {ncols1}, {ncols2});\n"
 
 SOURCE_FATTN_MMA_NVFP4_FP8_CASE = "DECL_FATTN_MMA_F16_CASE_NVFP4_FP8({head_size_kq}, {head_size_v}, {ncols1}, {ncols2});\n"
@@ -110,6 +112,10 @@ for ncols in [8, 16, 32, 64]:
             # NVFP4 KV-cache fused inline-dequant variant: head-dim 128 only, ncols2 in {1,2,4,8}.
             if ncols2 in (1, 2, 4, 8):
                 f.write(SOURCE_FATTN_MMA_NVFP4_CASE.format(ncols1=ncols1, ncols2=ncols2, head_size_kq=128, head_size_v=128))
+
+            # MXFP4 KV-cache fused inline-dequant variant: head-dim 128 only, ncols2 in {1,2,4,8}.
+            if ncols2 in (1, 2, 4, 8):
+                f.write(SOURCE_FATTN_MMA_MXFP4_CASE.format(ncols1=ncols1, ncols2=ncols2, head_size_kq=128, head_size_v=128))
 
             # FP8-direct variant: head-dim 128 only, ncols2 in {1,2,4,8}.
             if ncols2 in (1, 2, 4, 8):

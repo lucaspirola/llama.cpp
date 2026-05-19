@@ -613,6 +613,53 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
         };
         ggml_cuda_unroll<6>{}(load);
         return;
+    } else if constexpr (std::is_same_v<KV_src_t, block_mxfp4>) {
+        // MXFP4 path: synchronous plain loads of the 17-byte blocks. K and V are both
+        // dequantized inline to the shared f16 tile (one E8M0 scale per 32-element
+        // block -- no FP8 compute path, no sub-block split). block_mxfp4 is not a
+        // 16-byte multiple so cp.async is not used here.
+        static_assert(!use_cp_async, "cp_async not supported for block_mxfp4 tiles");
+        static_assert(h2_per_chunk == 4, "mxfp4 chunk decode assumes 4 half2/chunk");
+        const half2 zero[4] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
+        auto load = [&] __device__ (const int n) {
+            const int stride_k = 32 >> n;
+            const int k0_start = stride_k == 32 ? 0 : chunks_per_row - chunks_per_row % (2*stride_k);
+            const int k0_stop  =                      chunks_per_row - chunks_per_row % (1*stride_k);
+            const int stride_i = warp_size / stride_k;
+
+            if (k0_start == k0_stop) {
+                return;
+            }
+
+#pragma unroll
+            for (int i0 = 0; i0 < nbatch_fa; i0 += nwarps*stride_i) {
+                const int i = i0 + threadIdx.y*stride_i + (stride_k == warp_size ? 0 : threadIdx.x / stride_k);
+
+                if (i0 + nwarps*stride_i > nbatch_fa && i >= nbatch_fa) {
+                    break;
+                }
+
+#pragma unroll
+                for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
+                    const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
+
+                    half2 * dst = tile_KV + i*stride_tile + k*h2_per_chunk;
+                    if (!oob_check || i < i_sup) {
+                        // One 16-byte chunk == h2_per_chunk (4) half2 == 8 MXFP4 elements;
+                        // el0 = k*8 is a multiple of 8, so the whole chunk shares one block.
+                        const block_mxfp4 * row = KV + i*stride_KV;
+                        dequantize_mxfp4_chunk(row, k*h2_per_chunk*2, dst);
+                    } else {
+#pragma unroll
+                        for (int c = 0; c < h2_per_chunk; ++c) {
+                            dst[c] = zero[c];
+                        }
+                    }
+                }
+            }
+        };
+        ggml_cuda_unroll<6>{}(load);
+        return;
     } else if constexpr (std::is_same_v<KV_src_t, block_f8_e4m3>) {
         // FP8 E4M3 path: synchronous plain loads of the 34-byte blocks.
         // block_f8_e4m3 is not a 16-byte multiple so cp.async is not used here.
@@ -891,6 +938,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int  nbatch_V2       = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg (DKQ, DV, ncols);
     constexpr bool is_nvfp4        = std::is_same_v<KV_src_t, block_nvfp4>;
+    constexpr bool is_mxfp4        = std::is_same_v<KV_src_t, block_mxfp4>;
 
     // The FP8 K*Q^T path needs Ada (sm_89+) tensor cores; below Ada it is dead code and
     // the f16 path runs instead. use_fp8_kq is a compile-time constant so exactly one of
@@ -905,16 +953,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     // for the direct E4M3 MMA when K is stored as block_f8_e4m3, or as block_nvfp4 routed
     // through the FP8 compute path (NVFP4 is transcoded to E4M3 on load).
     constexpr bool k_tile_has_raw_e4m3 = std::is_same_v<KV_src_t, block_f8_e4m3> || (is_nvfp4 && use_fp8_kq);
-    // NVFP4 and raw-E4M3 K/V are loaded with synchronous plain loads + inline dequant,
-    // so the cp.async pipeline is disabled for them (nstages forced to 0 == fully sync).
-    constexpr int  nstages         = is_nvfp4 || k_tile_has_raw_e4m3 ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
+    // NVFP4, MXFP4 and raw-E4M3 K/V are loaded with synchronous plain loads + inline
+    // dequant, so the cp.async pipeline is disabled for them (nstages forced to 0).
+    constexpr int  nstages         = is_nvfp4 || is_mxfp4 || k_tile_has_raw_e4m3 ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
 
-    // The NVFP4 and raw-E4M3 loaders treat k0_start / i0_start as element offsets into
-    // a block_nvfp4 / block_f8_e4m3 row, which is only correct when the K/V loops run as a
-    // single iteration (offset 0). That holds iff the per-iteration batch covers the whole
-    // head dim.
-    static_assert(!(is_nvfp4 || k_tile_has_raw_e4m3) || (nbatch_K2 >= DKQ/2 && nbatch_V2 >= DV/2),
-        "NVFP4 / raw-E4M3 inline dequant requires single-iteration K/V tile loads");
+    // The NVFP4, MXFP4 and raw-E4M3 loaders treat k0_start / i0_start as element offsets
+    // into a block_nvfp4 / block_mxfp4 / block_f8_e4m3 row, which is only correct when the
+    // K/V loops run as a single iteration (offset 0). That holds iff the per-iteration
+    // batch covers the whole head dim.
+    static_assert(!(is_nvfp4 || is_mxfp4 || k_tile_has_raw_e4m3) || (nbatch_K2 >= DKQ/2 && nbatch_V2 >= DV/2),
+        "NVFP4 / MXFP4 / raw-E4M3 inline dequant requires single-iteration K/V tile loads");
 
     constexpr int stride_tile_Q = DKQ/2     + 4;
     constexpr int stride_tile_K = nbatch_K2 + 4;
@@ -955,7 +1003,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int k0_diff = k0_stop - k0_start;
 
         if constexpr (nstages <= 1) {
-            constexpr bool use_cp_async = !is_nvfp4 && !k_tile_has_raw_e4m3 && nstages == 1;
+            constexpr bool use_cp_async = !is_nvfp4 && !is_mxfp4 && !k_tile_has_raw_e4m3 && nstages == 1;
             flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, KV_src_t, false, KQ_compute_t>
                 (K_h2 + int64_t(k_VKQ_0)*stride_K + k0_start, tile_K, k0_diff, stride_K, k_VKQ_sup);
             if (use_cp_async) {
@@ -1382,7 +1430,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
         if constexpr (nstages <= 1) {
             if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
-                constexpr bool use_cp_async = !is_nvfp4 && !k_tile_has_raw_e4m3 && nstages == 1;
+                constexpr bool use_cp_async = !is_nvfp4 && !is_mxfp4 && !k_tile_has_raw_e4m3 && nstages == 1;
                 flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check, KV_src_t, true>
                     (V_h2 + int64_t(k_VKQ_0)*stride_V + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_sup);
                 if (use_cp_async) {
@@ -1584,6 +1632,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
     constexpr bool is_nvfp4        = std::is_same_v<KV_src_t, block_nvfp4>;
+    constexpr bool is_mxfp4        = std::is_same_v<KV_src_t, block_mxfp4>;
 
 #ifdef FP8_MMA_AVAILABLE
     constexpr bool use_fp8_kq      = std::is_same_v<KQ_compute_t, kq_compute_fp8> && DKQ == 128;
@@ -1594,9 +1643,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     // See flash_attn_ext_f16_iter: the K tile holds raw E4M3 for block_f8_e4m3 and for
     // block_nvfp4 routed through the FP8 compute path.
     constexpr bool k_tile_has_raw_e4m3 = std::is_same_v<KV_src_t, block_f8_e4m3> || (is_nvfp4 && use_fp8_kq);
-    // NVFP4 and raw-E4M3 K/V use synchronous plain loads + inline dequant, so multi-stage
-    // cp.async is off.
-    constexpr int  nstages         = is_nvfp4 || k_tile_has_raw_e4m3 ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
+    // NVFP4, MXFP4 and raw-E4M3 K/V use synchronous plain loads + inline dequant, so
+    // multi-stage cp.async is off.
+    constexpr int  nstages         = is_nvfp4 || is_mxfp4 || k_tile_has_raw_e4m3 ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
 
     if (cols_per_warp > ncols) {
         NO_DEVICE_CODE;
@@ -2352,9 +2401,11 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     const int cc = ggml_cuda_info().devices[id].cc;
 
     constexpr int ncols = ncols1 * ncols2;
-    // NVFP4 and raw-E4M3 K/V are dequantized/packed inline; the multi-stage cp.async
-    // pipeline is disabled and launch_fattn must not allocate an f16 K/V scratch buffer.
+    // NVFP4, MXFP4 and raw-E4M3 K/V are dequantized/packed inline; the multi-stage
+    // cp.async pipeline is disabled and launch_fattn must not allocate an f16 K/V
+    // scratch buffer.
     constexpr bool is_nvfp4      = std::is_same_v<KV_src_t, block_nvfp4>;
+    constexpr bool is_mxfp4      = std::is_same_v<KV_src_t, block_mxfp4>;
 
     constexpr bool is_fp8_kq = std::is_same_v<KQ_compute_t, kq_compute_fp8>;
     static_assert(!is_fp8_kq || DKQ == 128, "FP8 K*Q^T compute is only implemented for head dim 128");
@@ -2369,7 +2420,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     const int  nbatch_V2      = ggml_cuda_fattn_mma_get_nbatch_V2     (DKQ, DV, ncols, cc);
     const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
     const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
-    const int  nstages        = is_nvfp4 || k_tile_has_raw_e4m3 ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, cc);
+    const int  nstages        = is_nvfp4 || is_mxfp4 || k_tile_has_raw_e4m3 ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, cc);
 
     const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
     const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
@@ -2422,10 +2473,10 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 #endif // !defined(GGML_USE_MUSA)
     }
 
-    // For NVFP4 and raw-E4M3 K/V, launch_fattn must NOT allocate the f16 scratch buffer
-    // or rewrite the K/V strides: the kernel reads the raw blocks (NVFP4 / block_f8_e4m3)
-    // and dequantizes/packs them inline.
-    constexpr bool need_f16_KV = !is_nvfp4 && !k_tile_has_raw_e4m3;
+    // For NVFP4, MXFP4 and raw-E4M3 K/V, launch_fattn must NOT allocate the f16 scratch
+    // buffer or rewrite the K/V strides: the kernel reads the raw blocks (NVFP4 / MXFP4 /
+    // block_f8_e4m3) and dequantizes/packs them inline.
+    constexpr bool need_f16_KV = !is_nvfp4 && !is_mxfp4 && !k_tile_has_raw_e4m3;
     launch_fattn<DV, ncols1, ncols2>
         (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, need_f16_KV, need_f16_KV, true, warp_size_host);
 }
@@ -2439,6 +2490,11 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 #define DECL_FATTN_MMA_F16_CASE_NVFP4(DKQ, DV, ncols1, ncols2)                                 \
     template void ggml_cuda_flash_attn_ext_mma_f16_case                                        \
     <DKQ, DV, ncols1, ncols2, block_nvfp4>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
+
+// MXFP4 K/V variant: same shared f16 MMA kernel, K/V dequantized inline.
+#define DECL_FATTN_MMA_F16_CASE_MXFP4(DKQ, DV, ncols1, ncols2)                                 \
+    template void ggml_cuda_flash_attn_ext_mma_f16_case                                        \
+    <DKQ, DV, ncols1, ncols2, block_mxfp4>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
 
 // FP8-direct variant: K/V read raw as block_f8_e4m3 (no f16 scratch), K*Q^T on E4M3 cores.
 #define DECL_FATTN_MMA_F16_CASE_FP8DIRECT(DKQ, DV, ncols1, ncols2)                                              \

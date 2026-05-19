@@ -146,6 +146,41 @@ static void ggml_cuda_flash_attn_ext_mma_f16_nvfp4(ggml_backend_cuda_context & c
     ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<128, 128, 1, block_nvfp4>(ctx, dst);
 }
 
+// MXFP4 KV-cache: fused inline-dequant variant of the f16 MMA kernel. MXFP4 K/V
+// are head-dim 128 only; the kernel dequantizes the MXFP4 blocks into the shared
+// half2 tile during the load, so no separate f16 K/V scratch buffer is allocated.
+// The ncols1/ncols2 selection mirrors ggml_cuda_flash_attn_ext_mma_f16_nvfp4.
+static void ggml_cuda_flash_attn_ext_mma_f16_mxfp4(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * KQV  = dst;
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * mask = dst->src[3];
+
+    GGML_ASSERT(Q->ne[0] == 128 && dst->src[2]->ne[0] == 128);
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+
+    const bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+    if (use_gqa_opt && gqa_ratio > 4) {
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<128, 128, 8, block_mxfp4>(ctx, dst);
+        return;
+    }
+    if (use_gqa_opt && gqa_ratio > 2) {
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<128, 128, 4, block_mxfp4>(ctx, dst);
+        return;
+    }
+    if (use_gqa_opt && gqa_ratio > 1) {
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<128, 128, 2, block_mxfp4>(ctx, dst);
+        return;
+    }
+    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<128, 128, 1, block_mxfp4>(ctx, dst);
+}
+
 // F8_E4M3 KV-cache: FP8-direct variant of the f16 MMA kernel, head-dim 128 only.
 // KV_src_t is block_f8_e4m3, so launch_fattn allocates no f16 scratch: the kernel reads
 // the raw E4M3 K/V blocks straight from the cache and runs K*Q^T on the FP8 tensor
@@ -243,6 +278,15 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
         } else {
             ggml_cuda_flash_attn_ext_mma_f16_nvfp4(ctx, dst);
         }
+        return;
+    }
+
+    // MXFP4 KV-cache with head-dim 128 routes to the fused inline-dequant variant
+    // of this kernel. Other head dims fall through to the standard f16-conversion
+    // MMA path (launch_fattn converts MXFP4 K/V to f16 scratch buffers).
+    if (K->type == GGML_TYPE_MXFP4 && V->type == GGML_TYPE_MXFP4
+            && Q->ne[0] == 128 && V->ne[0] == 128) {
+        ggml_cuda_flash_attn_ext_mma_f16_mxfp4(ctx, dst);
         return;
     }
 
@@ -672,9 +716,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 return BEST_FATTN_KERNEL_VEC;
             }
         }
-        // NVFP4 KV-cache prefill (head-dim 128) is handled by the fused inline-dequant
-        // variant of the f16 MMA kernel; see ggml_cuda_flash_attn_ext_mma_f16. F8_E4M3
-        // KV also routes here but uses the standard f16-scratch conversion (no fused kernel).
+        // NVFP4 and MXFP4 KV-cache prefill (head-dim 128) are handled by the fused
+        // inline-dequant variant of the f16 MMA kernel; see ggml_cuda_flash_attn_ext_mma_f16.
+        // F8_E4M3 KV also routes here but uses the standard f16-scratch conversion.
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
