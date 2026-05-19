@@ -203,6 +203,49 @@ static __device__ __forceinline__ uint8_t best_index_mxfp4(float x, float e) {
     return best_index;
 }
 
+// Device equivalent of ggml_e8m0_to_fp32_half() (ggml-impl.h) -- the half-scale
+// E8M0 decode used by quantize_row_mxfp4_ref(). Replicated by exact integer bit
+// manipulation (not ggml_cuda_e8m0_to_fp32()*0.5f) so the device MXFP4 quantizer
+// produces byte-identical output to the CPU reference.
+static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32_half(uint8_t x) {
+    uint32_t bits;
+    if (x < 2) {
+        bits = 0x00200000u << x;
+    } else {
+        bits = (uint32_t) (x - 1) << 23;
+    }
+    return __int_as_float(bits);
+}
+
+// Quantize a 32-value F32 block to MXFP4. Mirror of quantize_row_mxfp4_ref()
+// (ggml-quants.c) -- must stay bit-identical: this is a KV-cache write path and
+// test-backend-ops compares it against the CPU backend. The E8M0 scale is a single
+// closed-form floorf(log2f(amax)) code -- no scale search, unlike NVFP4. Scalar
+// fabsf()/'<' for amax rather than fmaxf(): under CUDA flush-to-zero fmaxf() would
+// flush a denormal amax to 0, diverging from the CPU reference.
+static __device__ void quantize_f32_mxfp4_block(const float * __restrict__ x, block_mxfp4 * __restrict__ y) {
+    float amax = 0.0f;
+    for (int j = 0; j < QK_MXFP4; ++j) {
+        const float a = fabsf(x[j]);
+        if (amax < a) {
+            amax = a;
+        }
+    }
+
+    const uint8_t e = amax > 0.0f ? (uint8_t) (floorf(log2f(amax)) - 2 + 127) : 0;
+    const float   d = ggml_cuda_e8m0_to_fp32_half(e);
+
+    y->e = e;
+
+    for (int j = 0; j < QK_MXFP4/2; ++j) {
+        const uint8_t x0 = best_index_mxfp4(x[0           + j], d);
+        const uint8_t x1 = best_index_mxfp4(x[QK_MXFP4/2 + j], d);
+
+        y->qs[j]  = x0;
+        y->qs[j] |= x1 << 4;
+    }
+}
+
 // Same scan as best_index_mxfp4() but returns the chosen kvalues_mxfp4 entry
 // scaled by e (i.e. kvalues_mxfp4[best_index]*e). Picking the value during the
 // uniform i-loop avoids a second, data-dependent kvalues_mxfp4[] index: under a
@@ -415,6 +458,10 @@ static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
 
 static __device__ void cpy_blck_f32_nvfp4(const char * cxi, char * cdsti) {
     quantize_f32_nvfp4_block((const float *)cxi, (block_nvfp4 *)cdsti);
+}
+
+static __device__ void cpy_blck_f32_mxfp4(const char * cxi, char * cdsti) {
+    quantize_f32_mxfp4_block((const float *)cxi, (block_mxfp4 *)cdsti);
 }
 
 static __device__ void quantize_f32_f8_e4m3_block(const float * __restrict__ x, block_f8_e4m3 * __restrict__ y) {
