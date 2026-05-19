@@ -203,6 +203,27 @@ static __device__ __forceinline__ uint8_t best_index_mxfp4(float x, float e) {
     return best_index;
 }
 
+// Same scan as best_index_mxfp4() but returns the chosen kvalues_mxfp4 entry
+// scaled by e (i.e. kvalues_mxfp4[best_index]*e). Picking the value during the
+// uniform i-loop avoids a second, data-dependent kvalues_mxfp4[] index: under a
+// warp that divergent constant-memory load serialises across the 32 lanes, which
+// is the dominant cost of the per-code error scan. The selected float is the
+// same one a kvalues_mxfp4[best_index_mxfp4(x,e)]*e expression would yield, so
+// the squared-error sum stays bit-identical to the scalar / CPU reference.
+static __device__ __forceinline__ float best_scaled_mxfp4(float x, float e) {
+    float best_val = kvalues_mxfp4[0]*e;
+    float best_err = fabsf(best_val - x);
+    for (int i = 1; i < 16; ++i) {
+        const float val = kvalues_mxfp4[i]*e;
+        const float err = fabsf(val - x);
+        if (err < best_err) {
+            best_err = err;
+            best_val = val;
+        }
+    }
+    return best_val;
+}
+
 static __device__ void quantize_f32_nvfp4_block(const float * __restrict__ x, block_nvfp4 * __restrict__ y) {
     constexpr int n_sub = QK_NVFP4 / QK_NVFP4_SUB; // 4 sub-blocks of 16 values
 
@@ -271,13 +292,15 @@ static __device__ __forceinline__ uint64_t pack_err_uec(float err, uint8_t uec) 
     return ((uint64_t) __float_as_uint(err) << 32) | (uint64_t) uec;
 }
 
-// Warp-wide argmin over (err, uec): every lane contributes its local best, the
-// result (the lowest-error code, lower code on ties) is returned to every lane.
-static __device__ __forceinline__ uint8_t warp_argmin_err_uec(float err, uint8_t uec) {
+// Argmin over (err, uec) within a contiguous group of GROUP lanes (GROUP must be
+// a power of two, <= 32). Every lane in the group contributes its local best and
+// receives the group result: the lowest-error code, the lower code on ties.
+template <int GROUP>
+static __device__ __forceinline__ uint8_t group_argmin_err_uec(float err, uint8_t uec) {
     uint64_t val = pack_err_uec(err, uec);
 #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        const uint64_t o = __shfl_xor_sync(0xFFFFFFFF, val, offset, 32);
+    for (int offset = GROUP/2; offset > 0; offset >>= 1) {
+        const uint64_t o = __shfl_xor_sync(0xFFFFFFFF, val, offset, GROUP);
         if (o < val) {
             val = o;
         }
@@ -285,76 +308,83 @@ static __device__ __forceinline__ uint8_t warp_argmin_err_uec(float err, uint8_t
     return (uint8_t) (val & 0xFF);
 }
 
-// Warp-cooperative NVFP4 quantizer: one 32-lane warp per block_nvfp4. The 25x
-// heavier full-range UE4M3 scan is split across the 32 lanes (4 codes each), so
-// the per-block cost stays close to the old narrow-window scalar version. The
-// per-code SSE sum keeps the exact CPU op order (in-order j=0..15) so the result
-// is bit-identical to quantize_f32_nvfp4_block() / the CPU reference.
+// Warp-cooperative NVFP4 quantizer: one 32-lane warp per block_nvfp4. The block's
+// 4 sub-blocks are mapped onto 4 lane groups of 8 (sub = lane>>3, gl = lane&7) so
+// all four sub-blocks are processed in parallel -- no lane is idle while another
+// sub-block runs. Within an 8-lane group the full [1,0x7E] UE4M3 scan is split
+// across the 8 lanes (~16 codes each). Every per-code error sum keeps the exact
+// CPU op order (in-order j=0..15) so the winning scale, and the packed E2M1
+// nibbles, are bit-identical to quantize_f32_nvfp4_block() / the CPU reference.
 static __device__ void quantize_f32_nvfp4_block_warp(const float * __restrict__ x,
                                                      block_nvfp4 * __restrict__ y) {
-    constexpr int n_sub = QK_NVFP4 / QK_NVFP4_SUB; // 4 sub-blocks of 16 values
+    constexpr int n_sub      = QK_NVFP4 / QK_NVFP4_SUB; // 4 sub-blocks of 16 values
+    constexpr int group_size = 32 / n_sub;              // 8 lanes per sub-block
 
-    const int lane = threadIdx.x; // 0..31, one warp per block
+    const int lane = threadIdx.x;        // 0..31, one warp per block
+    const int s    = lane / group_size;  // sub-block index 0..3
+    const int gl   = lane % group_size;  // lane within the sub-block group 0..7
 
-    for (int s = 0; s < n_sub; ++s) {
-        const float * xb = x + s*QK_NVFP4_SUB;
+    const float * xb = x + s*QK_NVFP4_SUB;
 
-        // Lane 0 computes amax with the same scalar comparison as the CPU reference
-        // (not fmaxf(): FTZ would flush a denormal amax to 0), then broadcasts it.
-        float amax = 0.0f;
-        if (lane == 0) {
-            for (int j = 0; j < QK_NVFP4_SUB; ++j) {
-                if (amax < fabsf(xb[j])) {
-                    amax = fabsf(xb[j]);
-                }
+    // amax with the same scalar comparison as the CPU reference (not fmaxf(): FTZ
+    // would flush a denormal amax to 0). Each lane scans its strided slice, then
+    // the group reduces -- max is order-independent so this matches the CPU.
+    float amax = 0.0f;
+    for (int j = gl; j < QK_NVFP4_SUB; j += group_size) {
+        if (amax < fabsf(xb[j])) {
+            amax = fabsf(xb[j]);
+        }
+    }
+#pragma unroll
+    for (int offset = group_size/2; offset > 0; offset >>= 1) {
+        const float o = __shfl_xor_sync(0xFFFFFFFF, amax, offset, group_size);
+        if (amax < o) {
+            amax = o;
+        }
+    }
+
+    if (amax == 0.0f) {
+        if (gl == 0) {
+            y->d[s] = 0;
+            for (int j = 0; j < QK_NVFP4_SUB/2; ++j) {
+                y->qs[s*(QK_NVFP4_SUB/2) + j] = 0;
             }
         }
-        amax = __shfl_sync(0xFFFFFFFF, amax, 0, 32);
+        return;
+    }
 
-        if (amax == 0.0f) {
-            if (lane == 0) {
-                y->d[s] = 0;
-                for (int j = 0; j < QK_NVFP4_SUB/2; ++j) {
-                    y->qs[s*(QK_NVFP4_SUB/2) + j] = 0;
-                }
-            }
+    // Each group lane evaluates codes uec = 1 + gl + k*group_size, covering the
+    // full [1,0x7E] range across the 8 lanes. Each code uses the same in-order SSE
+    // sum as the CPU so the bits match.
+    float   local_best_err = INFINITY;
+    uint8_t local_best_ue  = 1;
+#pragma unroll
+    for (int k = 0; k < (0x7E + group_size - 1) / group_size; ++k) {
+        const int uec = 1 + gl + k*group_size;
+        if (uec > 0x7E) {
             continue;
         }
-
-        // Each lane evaluates codes uec = 1 + lane + k*32 for k = 0..3, covering the
-        // full [1, 0x7E] range across the warp. Each code uses the same in-order SSE
-        // sum as the CPU so the bits match.
-        float   local_best_err = INFINITY;
-        uint8_t local_best_ue  = 1;
-#pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            const int uec = 1 + lane + k*32;
-            if (uec > 0x7E) {
-                continue;
-            }
-            const float dc = ggml_cuda_ue4m3_to_fp32((uint8_t) uec);
-            float err = 0.0f;
-            for (int j = 0; j < QK_NVFP4_SUB; ++j) {
-                const float r = kvalues_mxfp4[best_index_mxfp4(xb[j], dc)]*dc - xb[j];
-                err += r*r;
-            }
-            if (err < local_best_err) {
-                local_best_err = err;
-                local_best_ue  = (uint8_t) uec;
-            }
+        const float dc = ggml_cuda_ue4m3_to_fp32((uint8_t) uec);
+        float err = 0.0f;
+        for (int j = 0; j < QK_NVFP4_SUB; ++j) {
+            const float r = best_scaled_mxfp4(xb[j], dc) - xb[j];
+            err += r*r;
         }
-
-        const uint8_t best_ue = warp_argmin_err_uec(local_best_err, local_best_ue);
-
-        if (lane == 0) {
-            y->d[s] = best_ue;
-            const float d = ggml_cuda_ue4m3_to_fp32(best_ue);
-            for (int j = 0; j < QK_NVFP4_SUB/2; ++j) {
-                const uint8_t x0 = best_index_mxfp4(xb[0              + j], d);
-                const uint8_t x1 = best_index_mxfp4(xb[QK_NVFP4_SUB/2 + j], d);
-                y->qs[s*(QK_NVFP4_SUB/2) + j] = x0 | (x1 << 4);
-            }
+        if (err < local_best_err) {
+            local_best_err = err;
+            local_best_ue  = (uint8_t) uec;
         }
+    }
+
+    const uint8_t best_ue = group_argmin_err_uec<group_size>(local_best_err, local_best_ue);
+
+    // 8 lanes pack the 8 nibble bytes of the sub-block, one byte per lane.
+    const float d = ggml_cuda_ue4m3_to_fp32(best_ue);
+    const uint8_t x0 = best_index_mxfp4(xb[0              + gl], d);
+    const uint8_t x1 = best_index_mxfp4(xb[QK_NVFP4_SUB/2 + gl], d);
+    y->qs[s*(QK_NVFP4_SUB/2) + gl] = x0 | (x1 << 4);
+    if (gl == 0) {
+        y->d[s] = best_ue;
     }
 }
 
