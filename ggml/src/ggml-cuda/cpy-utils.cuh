@@ -230,18 +230,14 @@ static __device__ void quantize_f32_nvfp4_block(const float * __restrict__ x, bl
         // Mirror of quantize_row_nvfp4_ref() in ggml-quants.c -- must stay bit-identical.
         // amax/6 maps the largest E2M1 magnitude (6.0) to amax, but the UE4M3 sub-block
         // scale has only a 3-bit mantissa, so the code nearest to amax/6 is rarely the
-        // one that minimises reconstruction error. Search a small window of UE4M3 scale
-        // codes around it and keep the lowest-error one. Every code in [1, 0x7E] decodes
-        // to a finite non-zero scale (only code 0 and the NaN sentinel 0x7F decode to 0),
-        // so no zero-scale guard is needed inside the loop.
-        const uint8_t ue0 = ggml_cuda_fp32_to_ue4m3(amax / 6.0f);
-        uint8_t best_ue  = ue0;
+        // one that minimises reconstruction error. Scan every valid UE4M3 scale code and
+        // keep the lowest-error one. Codes in [1, 0x7E] all decode to a finite non-zero
+        // scale (only code 0 and the NaN sentinel 0x7F decode to 0), so no zero-scale
+        // guard is needed inside the loop. The scan is ascending with a strict-less-than
+        // test, so on equal error the lower code wins.
+        uint8_t best_ue  = 1;
         float   best_err = INFINITY;
-        for (int c = -2; c <= 2; ++c) {
-            const int uec = (int) ue0 + c;
-            if (uec < 1 || uec > 0x7E) {
-                continue;
-            }
+        for (int uec = 1; uec <= 0x7E; ++uec) {
             const float dc = ggml_cuda_ue4m3_to_fp32((uint8_t) uec);
             float err = 0.0f;
             for (int j = 0; j < QK_NVFP4_SUB; ++j) {
@@ -262,6 +258,102 @@ static __device__ void quantize_f32_nvfp4_block(const float * __restrict__ x, bl
             const uint8_t x1 = best_index_mxfp4(xb[QK_NVFP4_SUB/2 + j], d);
 
             y->qs[s*(QK_NVFP4_SUB/2) + j] = x0 | (x1 << 4);
+        }
+    }
+}
+
+// Pack a (squared-error, UE4M3 code) pair into one uint64 ordered for argmin.
+// Squared error is a non-negative IEEE float, so its raw bits sort as a uint32 in
+// the same order as the float value; placing it in the high 32 bits and the code
+// in the low 8 bits makes a plain uint64 compare order by error first, and on an
+// exact error tie pick the lower code -- matching the CPU scan's tie-break.
+static __device__ __forceinline__ uint64_t pack_err_uec(float err, uint8_t uec) {
+    return ((uint64_t) __float_as_uint(err) << 32) | (uint64_t) uec;
+}
+
+// Warp-wide argmin over (err, uec): every lane contributes its local best, the
+// result (the lowest-error code, lower code on ties) is returned to every lane.
+static __device__ __forceinline__ uint8_t warp_argmin_err_uec(float err, uint8_t uec) {
+    uint64_t val = pack_err_uec(err, uec);
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const uint64_t o = __shfl_xor_sync(0xFFFFFFFF, val, offset, 32);
+        if (o < val) {
+            val = o;
+        }
+    }
+    return (uint8_t) (val & 0xFF);
+}
+
+// Warp-cooperative NVFP4 quantizer: one 32-lane warp per block_nvfp4. The 25x
+// heavier full-range UE4M3 scan is split across the 32 lanes (4 codes each), so
+// the per-block cost stays close to the old narrow-window scalar version. The
+// per-code SSE sum keeps the exact CPU op order (in-order j=0..15) so the result
+// is bit-identical to quantize_f32_nvfp4_block() / the CPU reference.
+static __device__ void quantize_f32_nvfp4_block_warp(const float * __restrict__ x,
+                                                     block_nvfp4 * __restrict__ y) {
+    constexpr int n_sub = QK_NVFP4 / QK_NVFP4_SUB; // 4 sub-blocks of 16 values
+
+    const int lane = threadIdx.x; // 0..31, one warp per block
+
+    for (int s = 0; s < n_sub; ++s) {
+        const float * xb = x + s*QK_NVFP4_SUB;
+
+        // Lane 0 computes amax with the same scalar comparison as the CPU reference
+        // (not fmaxf(): FTZ would flush a denormal amax to 0), then broadcasts it.
+        float amax = 0.0f;
+        if (lane == 0) {
+            for (int j = 0; j < QK_NVFP4_SUB; ++j) {
+                if (amax < fabsf(xb[j])) {
+                    amax = fabsf(xb[j]);
+                }
+            }
+        }
+        amax = __shfl_sync(0xFFFFFFFF, amax, 0, 32);
+
+        if (amax == 0.0f) {
+            if (lane == 0) {
+                y->d[s] = 0;
+                for (int j = 0; j < QK_NVFP4_SUB/2; ++j) {
+                    y->qs[s*(QK_NVFP4_SUB/2) + j] = 0;
+                }
+            }
+            continue;
+        }
+
+        // Each lane evaluates codes uec = 1 + lane + k*32 for k = 0..3, covering the
+        // full [1, 0x7E] range across the warp. Each code uses the same in-order SSE
+        // sum as the CPU so the bits match.
+        float   local_best_err = INFINITY;
+        uint8_t local_best_ue  = 1;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int uec = 1 + lane + k*32;
+            if (uec > 0x7E) {
+                continue;
+            }
+            const float dc = ggml_cuda_ue4m3_to_fp32((uint8_t) uec);
+            float err = 0.0f;
+            for (int j = 0; j < QK_NVFP4_SUB; ++j) {
+                const float r = kvalues_mxfp4[best_index_mxfp4(xb[j], dc)]*dc - xb[j];
+                err += r*r;
+            }
+            if (err < local_best_err) {
+                local_best_err = err;
+                local_best_ue  = (uint8_t) uec;
+            }
+        }
+
+        const uint8_t best_ue = warp_argmin_err_uec(local_best_err, local_best_ue);
+
+        if (lane == 0) {
+            y->d[s] = best_ue;
+            const float d = ggml_cuda_ue4m3_to_fp32(best_ue);
+            for (int j = 0; j < QK_NVFP4_SUB/2; ++j) {
+                const uint8_t x0 = best_index_mxfp4(xb[0              + j], d);
+                const uint8_t x1 = best_index_mxfp4(xb[QK_NVFP4_SUB/2 + j], d);
+                y->qs[s*(QK_NVFP4_SUB/2) + j] = x0 | (x1 << 4);
+            }
         }
     }
 }
