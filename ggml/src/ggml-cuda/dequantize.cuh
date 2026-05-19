@@ -98,6 +98,18 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.y *= d;
 }
 
+static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_mxfp4 * x = (const block_mxfp4 *) vx;
+
+    // kvalues_mxfp4 stores 2*E2M1; the compensating 0.5 factor is folded into d.
+    const float d = ggml_cuda_e8m0_to_fp32(x[ib].e) * 0.5f;
+
+    const int vui = x[ib].qs[iqs];
+
+    v.x = kvalues_mxfp4[vui & 0xF] * d;
+    v.y = kvalues_mxfp4[vui >>  4] * d;
+}
+
 static __device__ __forceinline__ void dequantize_f8_e4m3(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_f8_e4m3 * x = (const block_f8_e4m3 *) vx;
 

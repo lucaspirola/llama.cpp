@@ -366,6 +366,43 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_nvfp4(
     return sum;
 }
 
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_mxfp4(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_mxfp4 * K_mxfp4 = (const block_mxfp4 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        // Each int holds 4 elements; an mxfp4 block is QK_MXFP4 elements = QK_MXFP4/4 element-ints.
+        const int ib = k_KQ / (QK_MXFP4/4);             // mxfp4 block
+        const int m  = k_KQ % (QK_MXFP4/4);             // element-int within block (0..7)
+
+        // A block's 32 values are packed 2/byte across 16 bytes (= four 4-byte groups):
+        // low nibbles hold values 0..15, high nibbles hold values 16..31. Of the 3-bit m,
+        // bits 0..1 select the 4-byte group and bit 2 selects the low/high nibble half.
+        const int  aux_q4 = get_int_b1(K_mxfp4[ib].qs, m & (QK_MXFP4/8 - 1));
+        const int2 v_full = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+        const int  v      = (m & (QK_MXFP4/8)) ? v_full.y : v_full.x;
+
+        const int u = Q_q8[k_KQ_0/nthreads];
+
+        const int sumi = ggml_cuda_dp4a(v, u, 0);
+
+        // kvalues_mxfp4 holds 2*E2M1; the compensating 0.5 factor is folded into K_d.
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        const float  K_d  = ggml_cuda_e8m0_to_fp32(K_mxfp4[ib].e) * 0.5f;
+        sum += K_d * Q_ds.x * sumi;
+    }
+
+    return sum;
+}
+
 template <typename Tds, int ni>
 static __device__ __forceinline__ void quantize_q8_1_to_shared(
     const float * __restrict__ x, const float scale, int * __restrict__ yq32, void * __restrict__ yds) {
@@ -729,6 +766,46 @@ static __device__ __forceinline__ void dequantize_V_nvfp4(const void * __restric
     }
 }
 
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_mxfp4(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_mxfp4 * x = (const block_mxfp4 *) vx;
+
+    const int64_t ib    =  i0 /  QK_MXFP4;
+    const int     il    =  i0 %  QK_MXFP4;            // element within block (0..31)
+    const int     shift =  il / (QK_MXFP4/2);         // 0 -> low nibble, 1 -> high nibble
+    const int     iqs   =  il % (QK_MXFP4/2);         // byte index in qs[]
+
+    uint8_t qs[ne];
+    static_assert(ne == 2 || ne == 4, "bad ne");
+    // block_mxfp4 is 17 bytes (odd size), so x[ib].qs is not guaranteed 2-byte aligned.
+    ggml_cuda_memcpy_1<ne, 1>(qs, x[ib].qs + iqs);
+
+    // kvalues_mxfp4 stores 2*E2M1; the compensating 0.5 factor is folded into d.
+    const float d = ggml_cuda_e8m0_to_fp32(x[ib].e) * 0.5f;
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        const half2 dh = __half2half2((half) d);
+
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            const int n0 = shift ? (qs[l0 + 0] >> 4) : (qs[l0 + 0] & 0x0F);
+            const int n1 = shift ? (qs[l0 + 1] >> 4) : (qs[l0 + 1] & 0x0F);
+            ((half2 *) dst)[l0/2] = dh * make_half2(kvalues_mxfp4[n0], kvalues_mxfp4[n1]);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            const int nibble = shift ? (qs[l] >> 4) : (qs[l] & 0x0F);
+            ((float *) dst)[l] = d * kvalues_mxfp4[nibble];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "bad type");
+    }
+}
+
 // Dequantize one 16-byte tile chunk: 8 consecutive NVFP4 elements (el0 .. el0+7)
 // of a K/V row into 4 half2. row_base points at the first block_nvfp4 of the row;
 // el0 is the element index within the row and must be a multiple of 8.
@@ -869,6 +946,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_NVFP4) {
         return vec_dot_fattn_vec_KQ_nvfp4<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_MXFP4) {
+        return vec_dot_fattn_vec_KQ_mxfp4<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_F8_E4M3) {
         return vec_dot_fattn_vec_KQ_f8_e4m3<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
@@ -895,6 +974,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_NVFP4) {
         return dequantize_V_nvfp4<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_MXFP4) {
+        return dequantize_V_mxfp4<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_F8_E4M3) {
         return dequantize_V_f8_e4m3<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
