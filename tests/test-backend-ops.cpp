@@ -8965,10 +8965,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_MXFP4));
 
     // NVFP4 KV cache prefill coverage (hsk=hsv=128, Q columns > 2): exercises the
-    // fused inline-dequant MMA kernel, which only dispatches for Q->ne[1] > 2 -- and,
-    // under GGML_CUDA_FA_NVFP4_FP8, the FP8 K*Q^T compute path. Sweep the ncols
-    // selection {3,4->4, 8->8, 16->16} so both the narrow and wide MMA are exercised;
-    // include a long-KV case so parallel_blocks > 1 verifies the KV-split combine path.
+    // fused inline-dequant MMA kernel, which only dispatches for Q->ne[1] > 2. Sweep
+    // the ncols selection {3,4->4, 8->8, 16->16} so both the narrow and wide MMA are
+    // exercised; include a long-KV case so parallel_blocks > 1 verifies the KV-split
+    // combine path.
     for (int nb : {3, 4, 8, 16}) {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4));
     }
@@ -8993,7 +8993,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // F8_E4M3 KV cache extra coverage. The type_KV loop only generates quantized cases
     // at hsk 64/72, so add an explicit hsk=128 case (the common Llama head size).
     // F8_E4M3 KV runs the VEC kernel for small batches; for hsk=128 prefill it runs the
-    // FP8 K*Q^T compute MMA kernel on Ada (sm_89+) and the f16-scratch MMA path below Ada.
+    // standard f16-scratch MMA path (launch_fattn converts F8_E4M3 K/V to f16 scratch).
     // The mixed F8_E4M3/F16 pairs only dispatch a kernel on builds with the full quant
     // matrix (-DGGML_CUDA_FA_ALL_QUANTS); on a standard build they report "not supported",
     // like the q8_0/q4_0 mixed cases.
@@ -9002,13 +9002,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,     GGML_TYPE_F8_E4M3));
 
     // F8_E4M3 KV cache prefill coverage (hsk=hsv=128, Q columns > 2): sweep the ncols
-    // selection {3,4->ncols 4, 8->8, 16->16} so both the narrow and wide FP8 K*Q^T MMA
-    // are exercised; include a long-KV case so parallel_blocks > 1 exercises the KV-split
+    // selection {3,4->ncols 4, 8->8, 16->16} so both the narrow and wide f16 MMA are
+    // exercised; include a long-KV case so parallel_blocks > 1 exercises the KV-split
     // combine path, plus max_bias / logit_softcap / permuted variants.
     for (int nb : {3, 4, 8, 16}) {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3));
     }
-    // GQA variants (in-kernel ncols2 > 1): exercise the FP8 K*Q^T path with grouped heads.
+    // GQA variants (in-kernel ncols2 > 1): exercise the f16 MMA path with grouped heads.
     // nb is swept past 16 so the largest ncols1 (e.g. ncols1=32, ncols2=2) is also covered.
     for (int nr2 : {2, 4}) {
         for (int nb : {4, 8, 16, 32, 64}) {
@@ -9023,6 +9023,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  256,   4, true, false, 8.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  256,   4, true, false, 0.0f, 8.0f, GGML_PREC_F32, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  256,   4, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F8_E4M3, GGML_TYPE_F8_E4M3, {0, 2, 1, 3}));
+
+    // MXFP4 KV cache prefill coverage (hsk=hsv=128, Q columns > 2), at parity with the
+    // NVFP4 block above: exercises the fused inline-dequant MMA kernel (dispatches for
+    // Q->ne[1] > 2). Sweep the ncols selection, GQA ratios, the long-KV split, max_bias,
+    // logit_softcap and a permuted (non-contiguous) variant.
+    for (int nb : {3, 4, 8, 16}) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+    }
+    for (int nr2 : {2, 4}) {
+        for (int nb : {4, 8, 16, 32, 64}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {nr2, 1}, 256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+        }
+    }
+    for (int kv : {512, 4096}) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {2, 1}, kv, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 4096,   4, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 4096,   8, true, true,  0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  256,   4, true, false, 8.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  256,   4, true, false, 0.0f, 8.0f, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  256,   4, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, {0, 2, 1, 3}));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
