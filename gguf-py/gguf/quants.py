@@ -813,6 +813,60 @@ class NVFP4(__Quant, qtype=GGMLQuantizationType.NVFP4):
                         np.where(ue4m3_exp >= 15, np.uint8(0x7E), normal_result)))
 
     @classmethod
+    # Bit-exact port of quantize_row_nvfp4_ref in ggml-quants.c
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_super = blocks.shape[0]
+        qk_sub = 16
+        n_sub = cls.block_size // qk_sub  # 4
+
+        # (n_super, n_sub, qk_sub)
+        xb = blocks.reshape(n_super, n_sub, qk_sub).astype(np.float32)
+        amax = np.abs(xb).max(axis=-1)  # (n_super, n_sub)
+
+        kvalues = np.array(cls.kvalues, dtype=np.int8).astype(np.float32).reshape(1, 1, 1, 16)
+
+        # Candidate UE4M3 scale codes 1..0x7E (all decode to finite non-zero scales).
+        codes = np.arange(1, 0x7F, dtype=np.uint8)  # (126,)
+        dc = cls.ue4m3_to_fp32(codes).astype(np.float32)  # (126,)
+
+        # For every candidate scale, quantize all elements with best_index_mxfp4 and
+        # compute the sum of squared reconstruction errors over each sub-block.
+        # errs: (n_super, n_sub, qk_sub, 16) -> argmin over kvalues -> reconstruct.
+        x4 = xb.reshape(n_super, n_sub, qk_sub, 1, 1)              # (.,.,.,1,1)
+        dc5 = dc.reshape(1, 1, 1, codes.size, 1)                   # (1,1,1,126,1)
+        recon = kvalues.reshape(1, 1, 1, 1, 16) * dc5              # (1,1,1,126,16)
+        # best_index_mxfp4: minimise |kvalue*dc - x|, lowest index wins ties.
+        idx_err = np.abs(recon - x4)                               # (.,.,.,126,16)
+        best_idx = np.argmin(idx_err, axis=-1)                     # (.,.,.,126)
+        chosen = np.take_along_axis(kvalues.reshape(1, 1, 1, 1, 16),
+                                    best_idx[..., np.newaxis], axis=-1)[..., 0]  # (.,.,.,126)
+        r = chosen * dc.reshape(1, 1, 1, codes.size) - xb[..., np.newaxis]       # (.,.,.,126)
+        sse = (r * r).sum(axis=2)                                  # (n_super, n_sub, 126)
+        # ascending scan with strict-less-than -> lowest code wins ties == argmin
+        best_code_idx = np.argmin(sse, axis=-1)                    # (n_super, n_sub)
+        best_ue = (best_code_idx + 1).astype(np.uint8)             # codes start at 1
+
+        # amax==0 sub-blocks: scale code 0
+        zero_mask = amax == 0.0
+        best_ue = np.where(zero_mask, np.uint8(0), best_ue)
+
+        d_final = cls.ue4m3_to_fp32(best_ue).astype(np.float32)    # (n_super, n_sub)
+
+        # Quantize each element with the chosen per-sub-block scale.
+        errs = np.abs(kvalues * d_final.reshape(n_super, n_sub, 1, 1)
+                      - xb.reshape(n_super, n_sub, qk_sub, 1))     # (.,.,qk_sub,16)
+        q = np.argmin(errs, axis=-1).astype(np.uint8)              # (n_super, n_sub, qk_sub)
+        # zero-scale sub-blocks emit all-zero codes
+        q = np.where(zero_mask.reshape(n_super, n_sub, 1), np.uint8(0), q)
+
+        lo = q[:, :, :qk_sub // 2]
+        hi = q[:, :, qk_sub // 2:]
+        qs = (lo | (hi << np.uint8(4))).astype(np.uint8)           # (n_super, n_sub, 8)
+        qs = qs.reshape(n_super, cls.block_size // 2)
+
+        return np.concatenate([best_ue, qs], axis=-1)
+
+    @classmethod
     def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
         n_super = blocks.shape[0]
 
