@@ -546,6 +546,9 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         ggml_cpy_q5_1_f32_cuda
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_NVFP4) {
+        // NVFP4 uses a bespoke warp-per-block kernel (its UE4M3 scale search is
+        // warp-cooperative); MXFP4 below uses the generic 1-thread-per-block path
+        // since its E8M0 scale is closed-form. See ggml_cpy_f32_{nvfp4,mxfp4}_cuda.
         ggml_cpy_f32_nvfp4_cuda
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F8_E4M3) {
