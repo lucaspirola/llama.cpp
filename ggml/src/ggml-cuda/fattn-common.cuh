@@ -880,6 +880,148 @@ static __device__ __forceinline__ void dequantize_mxfp4_chunk(
     dst[3] = d * make_half2(c1[2], c1[3]);
 }
 
+// Transcode one 16-byte tile chunk (8 consecutive NVFP4 elements el0 .. el0+7 of a K
+// row) to raw E4M3 for the direct e4m3 MMA: dst_e4m3 receives 8 packed E4M3 bytes, the
+// element el0+j landing at byte j, in the little-endian order load_tile_e4m3_direct
+// expects. Returns the representative scale of the 32-k MMA slice this chunk belongs to.
+//
+// The e4m3 m16n8k32 MMA consumes a single scale per 32-k slice, but NVFP4 carries a
+// UE4M3 scale per 16-element sub-block, i.e. two scales per slice. The representative
+// scale is the larger of the two; every E4M3 value is the NVFP4 code scaled by
+// (its own sub-block scale / representative scale) <= 1, so it stays within the +-12
+// NVFP4 code range. The compute path multiplies the f32 accumulator by the
+// representative scale, reconstructing the dequantized K value.
+static __device__ __forceinline__ float transcode_nvfp4_chunk_to_e4m3(
+        const block_nvfp4 * __restrict__ row_base, const int el0, uint8_t * __restrict__ dst_e4m3) {
+#ifdef FP8_MMA_AVAILABLE
+    static_assert(QK_NVFP4_SUB == 16,    "nvfp4->e4m3 transcode assumes 16-element sub-blocks");
+    static_assert(QK_NVFP4 % QK_F8_E4M3 == 0, "nvfp4 block must be a whole number of 32-k slices");
+
+    const int ib    = el0 /  QK_NVFP4;                       // nvfp4 block within the row
+    const int il    = el0 %  QK_NVFP4;                       // element within block (0..63)
+    const int s     = il /  QK_NVFP4_SUB;                    // 16-element sub-block (0..3)
+    const int shift = (il % QK_NVFP4_SUB) / (QK_NVFP4_SUB/2); // 0 -> low nibble, 1 -> high nibble
+
+    const block_nvfp4 & xb = row_base[ib];
+
+    // Decode the 8 codes exactly as dequantize_nvfp4_chunk does: each get_int_from_table_16
+    // yields an int2 of 4 low-nibble + 4 high-nibble codes packed as int8; kvalues_mxfp4
+    // stores 2*E2M1 and ggml_cuda_ue4m3_to_fp32 folds in the compensating 0.5 factor.
+    const int2 g0 = get_int_from_table_16(get_int_b1(xb.qs, 2*s + 0), kvalues_mxfp4);
+    const int2 g1 = get_int_from_table_16(get_int_b1(xb.qs, 2*s + 1), kvalues_mxfp4);
+    const int  v0 = shift ? g0.y : g0.x; // codes for elements el0+0 .. el0+3
+    const int  v1 = shift ? g1.y : g1.x; // codes for elements el0+4 .. el0+7
+
+    // A 32-k slice spans sub-blocks s and s^1 of the same nvfp4 block.
+    const float d_self = ggml_cuda_ue4m3_to_fp32(xb.d[s]);
+    const float d_pair = ggml_cuda_ue4m3_to_fp32(xb.d[s ^ 1]);
+    const float d_rep  = fmaxf(d_self, d_pair);
+    const float ratio  = d_rep > 0.0f ? d_self / d_rep : 0.0f;
+
+    const int8_t * c0 = (const int8_t *) &v0;
+    const int8_t * c1 = (const int8_t *) &v1;
+
+    // Convert each pair of normalized codes to E4M3 with the hardware f16->e4m3 cvt; the
+    // resulting uint16 holds element el0+2j in its low byte and el0+2j+1 in its high byte,
+    // matching the m16n8k32 A-operand byte order load_tile_e4m3_direct reads back.
+    uint16_t e[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int8_t * c = j < 2 ? c0 : c1;
+        const int      b = 2*(j & 1);
+        const half2 pair = __floats2half2_rn(c[b + 0] * ratio, c[b + 1] * ratio);
+        asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(e[j]) : "r"(*(const uint32_t *) &pair));
+    }
+
+    const uint32_t packed[2] = { (uint32_t) e[0] | ((uint32_t) e[1] << 16),
+                                 (uint32_t) e[2] | ((uint32_t) e[3] << 16) };
+    ggml_cuda_memcpy_1<8, 4>(dst_e4m3, packed);
+    return d_rep;
+#else
+    GGML_UNUSED_VARS(row_base, el0, dst_e4m3);
+    NO_DEVICE_CODE;
+    return 0.0f;
+#endif // FP8_MMA_AVAILABLE
+}
+
+// Transcode one 16-byte tile chunk (8 consecutive MXFP4 elements el0 .. el0+7 of a K
+// row) to raw E4M3 for the direct e4m3 MMA: dst_e4m3 receives 8 packed E4M3 bytes, the
+// element el0+j landing at byte j, in the order load_tile_e4m3_direct expects. Returns
+// the scale of the 32-k MMA slice this chunk belongs to.
+//
+// Simpler than transcode_nvfp4_chunk_to_e4m3: MXFP4 carries one E8M0 scale per
+// 32-element block and QK_MXFP4 == QK_F8_E4M3, so a 32-k MMA slice is exactly one
+// MXFP4 block with exactly one scale -- no "representative scale" / per-code ratio.
+// The E4M3 values are the raw 2*E2M1 codes (|code| <= 12, exact in E4M3); the compute
+// path multiplies the f32 accumulator by the returned scale.
+static __device__ __forceinline__ float transcode_mxfp4_chunk_to_e4m3(
+        const block_mxfp4 * __restrict__ row_base, const int el0, uint8_t * __restrict__ dst_e4m3) {
+#ifdef FP8_MMA_AVAILABLE
+    static_assert(QK_MXFP4 == QK_F8_E4M3, "mxfp4 block must equal one 32-k e4m3 MMA slice");
+
+    const int ib    = el0 /  QK_MXFP4;
+    const int il    = el0 %  QK_MXFP4;
+    const int shift = il / (QK_MXFP4/2);                // 0 -> low nibble, 1 -> high nibble
+    const int g0    = (il % (QK_MXFP4/2)) / 4;          // first of two 4-byte qs groups
+
+    const block_mxfp4 & xb = row_base[ib];
+
+    const int2 t0 = get_int_from_table_16(get_int_b1(xb.qs, g0 + 0), kvalues_mxfp4);
+    const int2 t1 = get_int_from_table_16(get_int_b1(xb.qs, g0 + 1), kvalues_mxfp4);
+    const int  v0 = shift ? t0.y : t0.x; // codes for elements el0+0 .. el0+3
+    const int  v1 = shift ? t1.y : t1.x; // codes for elements el0+4 .. el0+7
+
+    // kvalues_mxfp4 stores 2*E2M1; the compensating 0.5 factor is folded into the scale.
+    const float d_rep = ggml_cuda_e8m0_to_fp32(xb.e) * 0.5f;
+
+    const int8_t * c0 = (const int8_t *) &v0;
+    const int8_t * c1 = (const int8_t *) &v1;
+
+    // Convert each pair of raw codes to E4M3 with the hardware f16->e4m3 cvt; the
+    // resulting uint16 holds element el0+2j in its low byte and el0+2j+1 in its high
+    // byte, matching the m16n8k32 A-operand byte order load_tile_e4m3_direct reads back.
+    uint16_t e[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int8_t * c = j < 2 ? c0 : c1;
+        const int      b = 2*(j & 1);
+        const half2 pair = __floats2half2_rn(c[b + 0], c[b + 1]);
+        asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(e[j]) : "r"(*(const uint32_t *) &pair));
+    }
+
+    const uint32_t packed[2] = { (uint32_t) e[0] | ((uint32_t) e[1] << 16),
+                                 (uint32_t) e[2] | ((uint32_t) e[3] << 16) };
+    ggml_cuda_memcpy_1<8, 4>(dst_e4m3, packed);
+    return d_rep;
+#else
+    GGML_UNUSED_VARS(row_base, el0, dst_e4m3);
+    NO_DEVICE_CODE;
+    return 0.0f;
+#endif // FP8_MMA_AVAILABLE
+}
+
+// Dequantize one 16-byte tile chunk: 8 consecutive F8_E4M3 elements (el0 .. el0+7)
+// of a K/V row into 4 half2. row_base points at the first block_f8_e4m3 of the row;
+// el0 is the element index within the row and must be a multiple of 8.
+//
+// One block_f8_e4m3 holds QK_F8_E4M3 (32) elements, so el0/32 selects the block and
+// el0%32 the starting byte in qs[]. Because el0 is a multiple of 8, all 8 elements
+// share one block and its per-block scale d, which is applied once.
+static __device__ __forceinline__ void dequantize_f8_e4m3_chunk(
+        const block_f8_e4m3 * __restrict__ row_base, const int el0, half2 * __restrict__ dst) {
+    const int ib  = el0 / QK_F8_E4M3;
+    const int iqs = el0 % QK_F8_E4M3;
+
+    const block_f8_e4m3 & xb = row_base[ib];
+    const half2 d = __half2half2(xb.d);
+
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        dst[j] = d * make_half2(ggml_cuda_se4m3_to_fp32(xb.qs[iqs + 2*j + 0]),
+                                ggml_cuda_se4m3_to_fp32(xb.qs[iqs + 2*j + 1]));
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
